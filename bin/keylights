@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+readonly API_PATH="/elgato/lights"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  keylights json
+  keylights setup
+  keylights [all|DEVICE_ID] status
+  keylights [all|DEVICE_ID] on|off|toggle
+  keylights [all|DEVICE_ID] brightness <1-100>
+  keylights [all|DEVICE_ID] temperature <2900-7000>
+
+DEVICE_ID values are returned by `keylights json`.
+EOF
+}
+
+decode_avahi() {
+  local value="$1"
+  value="${value//\\032/ }"
+  value="${value//\\046/&}"
+  value="${value//\\092/\\}"
+  printf '%s' "$value"
+}
+
+discover_rows() {
+  command -v avahi-browse >/dev/null || return 1
+
+  avahi-browse -rcp _elg._tcp 2>/dev/null |
+    while IFS=';' read -r marker interface protocol service_name service_type domain host address port txt; do
+      [[ "$marker" == '=' && "$protocol" == IPv4 ]] || continue
+
+      local name id
+      name="$(decode_avahi "$service_name")"
+      id="$(sed -n 's/.*"id=\([^"]*\)".*/\1/p' <<<"$txt")"
+      [[ -n "$id" ]] || id="$host"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$name" "$address" "$port" "$host"
+    done |
+    awk -F '\t' '!seen[$1]++'
+}
+
+setup_available() {
+  command -v nmcli >/dev/null || return 1
+  nmcli -t -f SSID device wifi list --rescan no 2>/dev/null |
+    grep -q '^Elgato Key Light'
+}
+
+request() {
+  local method="$1" address="$2" port="$3" payload="${4:-}"
+  local args=(
+    --fail --silent
+    --connect-timeout 1 --max-time 3
+    --retry 3 --retry-delay 0 --retry-max-time 8 --retry-all-errors
+    --request "$method"
+  )
+
+  if [[ -n "$payload" ]]; then
+    args+=(--header 'Content-Type: application/json' --data "$payload")
+  fi
+
+  curl "${args[@]}" "http://${address}:${port}${API_PATH}"
+}
+
+read_state() {
+  request GET "$1" "$2" | jq -ce '.lights[0]'
+}
+
+set_state() {
+  local address="$1" port="$2" payload="$3"
+  request PUT "$address" "$port" "$(jq -cn --argjson light "$payload" '{numberOfLights: 1, lights: [$light]}')" |
+    jq -ce '.lights[0]'
+}
+
+json_status() {
+  local lights='[]' id name address port host state record setup=false
+
+  while IFS=$'\t' read -r id name address port host; do
+    [[ -n "$id" ]] || continue
+    if state="$(read_state "$address" "$port" 2>/dev/null)"; then
+      record="$(jq -cn \
+        --arg id "$id" --arg name "$name" --arg host "$host" --arg address "$address" \
+        --argjson port "$port" --argjson state "$state" \
+        '$state + {id:$id,name:$name,host:$host,address:$address,port:$port,reachable:true}')"
+    else
+      record="$(jq -cn \
+        --arg id "$id" --arg name "$name" --arg host "$host" --arg address "$address" \
+        --argjson port "$port" \
+        '{id:$id,name:$name,host:$host,address:$address,port:$port,reachable:false,on:0,brightness:20,temperature:213}')"
+    fi
+    lights="$(jq -cn --argjson lights "$lights" --argjson record "$record" '$lights + [$record]')"
+  done < <(discover_rows || true)
+
+  if setup_available; then setup=true; fi
+  jq -cn --argjson lights "$lights" --argjson setup "$setup" \
+    '{lights:$lights,setupAvailable:$setup}'
+}
+
+describe_state() {
+  local name="$1" state="$2"
+  local power brightness temperature_mired temperature_kelvin
+  power="$(jq -r 'if .on == 1 then "on" else "off" end' <<<"$state")"
+  brightness="$(jq -r '.brightness' <<<"$state")"
+  temperature_mired="$(jq -r '.temperature' <<<"$state")"
+  temperature_kelvin="$((1000000 / temperature_mired))"
+  printf '%s: %s, %s%%, %s K\n' "$name" "$power" "$brightness" "$temperature_kelvin"
+}
+
+run_one_action() {
+  local name="$1" address="$2" port="$3" action="$4" value="${5:-}"
+  local current payload result
+
+  case "$action" in
+    status)
+      result="$(read_state "$address" "$port")" || return 1
+      describe_state "$name" "$result"
+      ;;
+    on|off)
+      [[ "$action" == on ]] && payload='{"on":1}' || payload='{"on":0}'
+      result="$(set_state "$address" "$port" "$payload")" || return 1
+      describe_state "$name" "$result"
+      ;;
+    toggle)
+      current="$(read_state "$address" "$port")" || return 1
+      [[ "$(jq -r '.on' <<<"$current")" == 1 ]] && payload='{"on":0}' || payload='{"on":1}'
+      result="$(set_state "$address" "$port" "$payload")" || return 1
+      describe_state "$name" "$result"
+      ;;
+    brightness)
+      [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 100 )) || return 2
+      payload="$(jq -cn --argjson brightness "$value" '{brightness:$brightness}')"
+      result="$(set_state "$address" "$port" "$payload")" || return 1
+      describe_state "$name" "$result"
+      ;;
+    temperature)
+      [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 2900 && value <= 7000 )) || return 2
+      local mired=$(((1000000 + value / 2) / value))
+      payload="$(jq -cn --argjson temperature "$mired" '{temperature:$temperature}')"
+      result="$(set_state "$address" "$port" "$payload")" || return 1
+      describe_state "$name" "$result"
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+run_action() {
+  local target="$1" action="$2" value="${3:-}"
+  local id name address port host matched=0 failures=0
+  local work_dir
+  local -a pids=() labels=()
+
+  work_dir="$(mktemp -d)" || return 1
+
+  while IFS=$'\t' read -r id name address port host; do
+    [[ -n "$id" ]] || continue
+    [[ "$target" == all || "$target" == "$id" ]] || continue
+    matched=$((matched + 1))
+    labels+=("$name")
+    (
+      if run_one_action "$name" "$address" "$port" "$action" "$value"; then
+        exit 0
+      else
+        exit $?
+      fi
+    ) >"$work_dir/$matched.out" 2>/dev/null &
+    pids+=("$!")
+  done < <(discover_rows || true)
+
+  if (( matched == 0 )); then
+    rm -r -- "$work_dir"
+    printf 'No matching Key Light was found.\n' >&2
+    return 1
+  fi
+
+  local index status
+  for index in "${!pids[@]}"; do
+    status=0
+    wait "${pids[$index]}" || status=$?
+    if (( status == 0 )); then
+      cat "$work_dir/$((index + 1)).out"
+    else
+      printf '%s: did not respond\n' "${labels[$index]}" >&2
+      failures=$((failures + 1))
+    fi
+  done
+
+  rm -r -- "$work_dir"
+  (( failures == 0 ))
+}
+
+setup() {
+  local wifi_device networks selected previous_connection
+
+  command -v nmcli >/dev/null || {
+    zenity --error --title='Set up Key Lights' --text='NetworkManager is required for setup.'
+    return 1
+  }
+
+  wifi_device="$(nmcli -t -f DEVICE,TYPE device status | awk -F: '$2 == "wifi" { print $1; exit }')"
+  if [[ -z "$wifi_device" ]]; then
+    zenity --error --title='Set up Key Lights' --text='No Wi-Fi adapter was found.'
+    return 1
+  fi
+
+  nmcli device wifi rescan ifname "$wifi_device" >/dev/null 2>&1 || true
+  networks="$(
+    nmcli -t -f SSID,SIGNAL device wifi list ifname "$wifi_device" |
+      awk -F: '$1 ~ /^Elgato Key Light/ { print $1 "\t" $2 }' |
+      sort -u
+  )"
+
+  if [[ -z "$networks" ]]; then
+    zenity --info --title='Set up Key Lights' --width=460 \
+      --text='No unconfigured Elgato Key Light was found.\n\nHold RESET for at least 10 seconds until the light flashes three times. Wait a moment, then run “Set up” again.'
+    return 0
+  fi
+
+  selected="$(
+    printf '%s\n' "$networks" |
+      zenity --list --title='Set up Key Lights' --width=460 --height=300 \
+        --text='Choose the light to set up' \
+        --column='Elgato Wi-Fi' --column='Signal' --print-column=1
+  )" || return 0
+
+  previous_connection="$(
+    nmcli -t -f NAME,TYPE,DEVICE connection show --active |
+      awk -F: -v device="$wifi_device" '$2 == "802-11-wireless" && $3 == device { print $1; exit }'
+  )"
+
+  if ! nmcli device wifi connect "$selected" ifname "$wifi_device" >/dev/null; then
+    zenity --error --title='Set up Key Lights' --text='Could not connect directly to the light.'
+    return 1
+  fi
+
+  xdg-open 'http://192.168.62.1:9123/' >/dev/null 2>&1 &
+  zenity --info --title='Set up Key Lights' --width=520 \
+    --text='The Elgato setup page is open.\n\nEnter your Wi-Fi name, password, and security mode there. Click Connect on that page, then click OK here.'
+
+  if [[ -n "$previous_connection" ]]; then
+    nmcli connection up "$previous_connection" ifname "$wifi_device" >/dev/null 2>&1 || true
+  else
+    nmcli device disconnect "$wifi_device" >/dev/null 2>&1 || true
+  fi
+
+  notify-send --app-name='Key Lights' 'Key Lights' \
+    'Setup complete. Discovery may take up to 60 seconds.'
+}
+
+main() {
+  case "${1:-}" in
+    json) json_status; return ;;
+    setup) setup; return ;;
+    -h|--help|help) usage; return ;;
+  esac
+
+  local target="${1:-all}"
+  local action="${2:-status}"
+  local value="${3:-}"
+  run_action "$target" "$action" "$value"
+}
+
+main "$@"

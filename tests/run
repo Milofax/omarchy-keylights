@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+
+bash -n "$root/bin/keylights"
+jq empty "$root/manifest.json"
+
+grep -q '"id": "milofax.keylights"' "$root/manifest.json"
+grep -q 'moduleName: "milofax.keylights"' "$root/Panel.qml"
+grep -q 'ipcTarget: "milofax.keylights"' "$root/Panel.qml"
+
+if rg -n --glob '!tests/run' '192\.168\.1\.|Celtadon|elgato-key-light-[0-9a-f]+\.local' "$root"; then
+  printf 'Private network details found in repository.\n' >&2
+  exit 1
+fi
+
+printf 'Static checks passed.\n'
