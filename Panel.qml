@@ -7,8 +7,8 @@ import qs.Ui
 
 Panel {
   id: root
-  moduleName: "milofax.keylights"
-  ipcTarget: "milofax.keylights"
+  moduleName: "io.github.milofax.keylights"
+  ipcTarget: "io.github.milofax.keylights"
   manageIpc: false
 
   readonly property string tool: decodeURIComponent(String(Qt.resolvedUrl("bin/keylights")).replace(/^file:\/\//, ""))
@@ -19,8 +19,14 @@ Panel {
 
   property var lights: []
   property bool setupAvailable: false
+  property bool setupSupported: false
   property string errorText: ""
-  property var queuedCommand: []
+  property var commandQueue: []
+  property var activeCommand: null
+  property bool actionExitReceived: false
+  property bool actionOutputReceived: false
+  property int actionExitCode: 0
+  property string actionOutputText: ""
   property bool refreshPending: false
 
   readonly property int reachableCount: {
@@ -37,29 +43,62 @@ Panel {
   readonly property bool anyReachable: reachableCount > 0
   readonly property bool allReachable: lights.length > 0 && reachableCount === lights.length
   readonly property bool anyOn: onCount > 0
-  readonly property bool missing: setupAvailable || (lights.length > 0 && !allReachable)
-  readonly property var referenceLight: {
-    for (var i = 0; i < lights.length; i++) if (lights[i].reachable === true) return lights[i]
-    return null
+  readonly property bool missing: errorText !== "" || setupAvailable || (lights.length > 0 && !allReachable)
+  readonly property int brightnessPercent: {
+    var total = 0
+    var count = 0
+    for (var i = 0; i < lights.length; i++) {
+      if (lights[i].reachable !== true) continue
+      total += Number(lights[i].brightness || 20)
+      count++
+    }
+    return count > 0 ? Math.round(total / count) : 20
   }
-  readonly property int brightnessPercent: referenceLight ? Number(referenceLight.brightness || 20) : 20
+  readonly property bool brightnessMixed: {
+    var first = -1
+    for (var i = 0; i < lights.length; i++) {
+      if (lights[i].reachable !== true) continue
+      var value = Math.round(Number(lights[i].brightness || 20))
+      if (first < 0) first = value
+      else if (value !== first) return true
+    }
+    return false
+  }
   readonly property int temperatureKelvin: {
-    var mired = referenceLight ? Number(referenceLight.temperature || 213) : 213
-    return Math.round((1000000 / Math.max(143, mired)) / 100) * 100
+    var total = 0
+    var count = 0
+    for (var i = 0; i < lights.length; i++) {
+      if (lights[i].reachable !== true) continue
+      total += Math.round((1000000 / Math.max(143, Number(lights[i].temperature || 213))) / 100) * 100
+      count++
+    }
+    return count > 0 ? Math.round((total / count) / 100) * 100 : 4700
   }
+  readonly property bool temperatureMixed: {
+    var first = -1
+    for (var i = 0; i < lights.length; i++) {
+      if (lights[i].reachable !== true) continue
+      var value = Math.round((1000000 / Math.max(143, Number(lights[i].temperature || 213))) / 100) * 100
+      if (first < 0) first = value
+      else if (value !== first) return true
+    }
+    return false
+  }
+  readonly property bool settingsMixed: brightnessMixed || temperatureMixed
   readonly property string stateSummary: {
+    if (lights.length === 0 && errorText !== "") return "Discovery error"
     if (lights.length === 0 && setupAvailable) return "Ready to set up"
     if (!anyReachable) return "Not reachable"
     var status = onCount === 0 ? "Off" : (onCount === reachableCount ? "On" : onCount + " of " + reachableCount + " on")
-    return status + " · " + brightnessPercent + "% · " + temperatureKelvin + " K"
+    return settingsMixed ? status + " · Mixed settings" : status + " · " + brightnessPercent + "% · " + temperatureKelvin + " K"
   }
 
-  visible: lights.length > 0 || setupAvailable
+  visible: lights.length > 0 || setupAvailable || errorText !== ""
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
   function refresh() {
-    if (statusProcess.running || actionProcess.running) {
+    if (statusProcess.running || actionProcess.running || commandQueue.length > 0 || setupProcess.running) {
       refreshPending = true
       return
     }
@@ -70,10 +109,20 @@ Panel {
   function applyStatus(output) {
     try {
       var parsed = JSON.parse(String(output || "").trim())
-      lights = parsed.lights instanceof Array ? parsed.lights : []
       setupAvailable = parsed.setupAvailable === true
-      if (!anyReachable && lights.length > 0) errorText = "The lights are not reachable."
-      else if (errorText === "The lights are not reachable.") errorText = ""
+      setupSupported = parsed.setupSupported === true
+      if (parsed.error) {
+        errorText = String(parsed.error)
+        return
+      }
+
+      var nextLights = parsed.lights instanceof Array ? parsed.lights : []
+      var reachable = 0
+      for (var i = 0; i < nextLights.length; i++) if (nextLights[i].reachable === true) reachable++
+      lights = nextLights
+      errorText = nextLights.length > 0 && reachable < nextLights.length
+        ? "One or more lights are not reachable."
+        : ""
     } catch (error) {
       errorText = "Could not read the Key Light status."
     }
@@ -82,7 +131,9 @@ Panel {
   function optimisticLight(light, action, value) {
     var next = {
       id: light.id,
+      discoveryId: light.discoveryId,
       name: light.name,
+      product: light.product,
       host: light.host,
       address: light.address,
       port: light.port,
@@ -108,17 +159,134 @@ Panel {
     lights = next
   }
 
+  function targetsFor(target) {
+    var targets = []
+    for (var i = 0; i < lights.length; i++) {
+      var light = lights[i]
+      if (light.reachable !== true || (target !== "all" && target !== light.id)) continue
+      targets.push({
+        id: String(light.id),
+        discoveryId: String(light.discoveryId || light.id),
+        name: String(light.name || "Key Light"),
+        address: String(light.address),
+        port: Number(light.port)
+      })
+    }
+    return targets
+  }
+
+  function startNextCommand() {
+    if (actionProcess.running || commandQueue.length === 0) return
+    var next = commandQueue[0]
+    commandQueue = commandQueue.slice(1)
+    activeCommand = next
+    actionExitReceived = false
+    actionOutputReceived = false
+    actionExitCode = 0
+    actionOutputText = ""
+    actionProcess.command = [
+      tool,
+      "control",
+      next.action,
+      next.value === undefined || next.value === null ? "-" : String(Math.round(next.value)),
+      JSON.stringify(next.targets)
+    ]
+    actionProcess.running = true
+  }
+
+  function applyOptimisticTargets(targets, action, value) {
+    var targetIds = {}
+    for (var i = 0; i < targets.length; i++) targetIds[String(targets[i].id)] = true
+    var next = []
+    for (var j = 0; j < lights.length; j++) {
+      var light = lights[j]
+      next.push(targetIds[String(light.id)] ? optimisticLight(light, action, value) : light)
+    }
+    lights = next
+  }
+
+  function reapplyQueuedOptimism() {
+    for (var i = 0; i < commandQueue.length; i++) {
+      var command = commandQueue[i]
+      applyOptimisticTargets(command.targets, command.action, command.value)
+    }
+  }
+
   function runCommand(target, action, value) {
-    var command = [tool, target, action]
-    if (value !== undefined && value !== null && String(value) !== "") command.push(String(Math.round(value)))
-    applyOptimistic(target, action, value)
-    if (actionProcess.running) {
-      queuedCommand = command
+    var targets = targetsFor(target)
+    if (targets.length === 0) {
+      errorText = "No reachable Key Light is available."
       return
     }
+
+    applyOptimistic(target, action, value)
     errorText = ""
-    actionProcess.command = command
-    actionProcess.running = true
+    commandQueue = commandQueue.concat([{targets: targets, action: action, value: value}])
+    startNextCommand()
+  }
+
+  function applyControlResult(output) {
+    try {
+      var parsed = JSON.parse(String(output || "").trim())
+      var results = parsed.results instanceof Array ? parsed.results : []
+      var byId = {}
+      for (var i = 0; i < results.length; i++) byId[String(results[i].id)] = results[i]
+
+      var next = []
+      for (var j = 0; j < lights.length; j++) {
+        var light = lights[j]
+        var result = byId[String(light.id)]
+        if (!result) {
+          next.push(light)
+          continue
+        }
+        next.push({
+          id: light.id,
+          discoveryId: result.discoveryId || light.discoveryId,
+          name: light.name,
+          product: light.product,
+          host: light.host,
+          address: result.address || light.address,
+          port: Number(result.port || light.port),
+          reachable: result.ok === true,
+          on: result.on !== undefined ? Number(result.on) : Number(light.on || 0),
+          brightness: result.brightness !== undefined ? Number(result.brightness) : Number(light.brightness || 20),
+          temperature: result.temperature !== undefined ? Number(result.temperature) : Number(light.temperature || 213)
+        })
+      }
+      lights = next
+      reapplyQueuedOptimism()
+    } catch (error) {
+      errorText = "Could not read the Key Light response."
+    }
+  }
+
+  function finishActionIfReady() {
+    if (!activeCommand || !actionExitReceived || !actionOutputReceived) return
+
+    if (actionOutputText.trim() !== "") applyControlResult(actionOutputText)
+    else errorText = "The Key Light command returned no status."
+    if (actionExitCode !== 0) errorText = "One or more lights did not respond. Please try again."
+
+    activeCommand = null
+    if (commandQueue.length > 0) {
+      Qt.callLater(startNextCommand)
+    } else {
+      refreshPending = true
+      Qt.callLater(refresh)
+    }
+  }
+
+  function handleActionOutput(output) {
+    actionOutputText = String(output || "")
+    actionOutputReceived = true
+    finishActionIfReady()
+  }
+
+  function handleActionExit(exitCode) {
+    actionExitCode = exitCode
+    actionExitReceived = true
+    finishActionIfReady()
   }
 
   function lightLabel(light) {
@@ -128,11 +296,20 @@ Panel {
 
   function lightStatus(light) {
     if (!light || light.reachable !== true) return "Not reachable"
-    return Number(light.on) === 1 ? "On" : "Off"
+    var status = Number(light.on) === 1 ? "On" : "Off"
+    var kelvin = Math.round((1000000 / Math.max(143, Number(light.temperature || 213))) / 100) * 100
+    return status + " · " + Math.round(Number(light.brightness || 20)) + "% · " + kelvin + " K"
   }
 
   function startSetup() {
-    if (setupProcess.running) return
+    if (setupProcess.running || statusProcess.running || actionProcess.running || commandQueue.length > 0) {
+      errorText = "Wait for the current Key Light operation to finish."
+      return
+    }
+    if (!setupSupported) {
+      errorText = "Setup requires NetworkManager, Zenity, and a browser."
+      return
+    }
     setupProcess.running = true
     close()
   }
@@ -156,7 +333,7 @@ Panel {
       onStreamFinished: root.applyStatus(text)
     }
     onExited: function(exitCode) {
-      if (exitCode !== 0) root.errorText = "Could not discover Key Lights."
+      if (exitCode !== 0 && root.errorText === "") root.errorText = "Could not discover Key Lights."
       if (root.refreshPending && !actionProcess.running) Qt.callLater(root.refresh)
     }
   }
@@ -164,20 +341,12 @@ Panel {
   Process {
     id: actionProcess
     running: false
-    stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
-    onExited: function(exitCode) {
-      if (exitCode !== 0) root.errorText = "One or more lights did not respond. Please try again."
-      if (root.queuedCommand.length > 0) {
-        var next = root.queuedCommand
-        root.queuedCommand = []
-        actionProcess.command = next
-        actionProcess.running = true
-      } else {
-        root.refreshPending = true
-        Qt.callLater(root.refresh)
-      }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.handleActionOutput(text)
     }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) { root.handleActionExit(exitCode) }
   }
 
   Process {
@@ -387,7 +556,9 @@ Panel {
               }
               Text {
                 id: brightnessValue
-                text: Math.round(brightnessSlider.dragging ? brightnessSlider.liveValue : root.brightnessPercent) + "%"
+                text: brightnessSlider.dragging
+                  ? Math.round(brightnessSlider.liveValue) + "%"
+                  : (root.brightnessMixed ? "Mixed" : root.brightnessPercent + "%")
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -421,14 +592,16 @@ Panel {
               implicitHeight: Math.max(temperatureHeader.implicitHeight, temperatureValue.implicitHeight)
               PanelSectionHeader {
                 id: temperatureHeader
-                text: "TEMPERATURE"
+                text: "COLOR TEMPERATURE"
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 anchors.left: parent.left
               }
               Text {
                 id: temperatureValue
-                text: Math.round(temperatureSlider.dragging ? temperatureSlider.liveValue : root.temperatureKelvin) + " K"
+                text: temperatureSlider.dragging
+                  ? Math.round(temperatureSlider.liveValue / 100) * 100 + " K"
+                  : (root.temperatureMixed ? "Mixed" : root.temperatureKelvin + " K")
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -448,7 +621,9 @@ Panel {
               value: root.temperatureKelvin
               enabled: root.anyReachable
               opacity: enabled ? 1 : 0.45
-              onReleased: function(value) { root.runCommand("all", "temperature", value) }
+              onReleased: function(value) {
+                root.runCommand("all", "temperature", Math.round(value / 100) * 100)
+              }
             }
           }
 
@@ -482,7 +657,7 @@ Panel {
               tooltipText: "Set up a reset Key Light"
               foreground: root.foreground
               fontFamily: root.fontFamily
-              enabled: !setupProcess.running
+              enabled: root.setupSupported && !setupProcess.running
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               onClicked: root.startSetup()

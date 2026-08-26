@@ -2,17 +2,190 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
+work_dir="$(mktemp -d)"
+fake_bin="$work_dir/bin"
+state_file="$work_dir/state.json"
+
+cleanup() {
+  rm -r -- "$work_dir"
+}
+trap cleanup EXIT
+
+fail() {
+  printf 'Test failed: %s\n' "$*" >&2
+  exit 1
+}
+
+assert_jq() {
+  local json="$1" expression="$2" message="$3"
+  jq -e "$expression" <<<"$json" >/dev/null || fail "$message"
+}
 
 bash -n "$root/bin/keylights"
+shellcheck "$root/bin/keylights"
 jq empty "$root/manifest.json"
+omarchy plugin validate "$root"
 
-grep -q '"id": "milofax.keylights"' "$root/manifest.json"
-grep -q 'moduleName: "milofax.keylights"' "$root/Panel.qml"
-grep -q 'ipcTarget: "milofax.keylights"' "$root/Panel.qml"
+[[ -x "$root/bin/keylights" ]] || fail 'bin/keylights is not executable'
+[[ -z "$(find "$root" -name .git -prune -o -type l -print -quit)" ]] || fail 'plugin contains a symlink'
+
+grep -q '"id": "io.github.milofax.keylights"' "$root/manifest.json"
+grep -q 'moduleName: "io.github.milofax.keylights"' "$root/Panel.qml"
+grep -q 'ipcTarget: "io.github.milofax.keylights"' "$root/Panel.qml"
+grep -q 'property var commandQueue: \[\]' "$root/Panel.qml"
+grep -q '!actionExitReceived || !actionOutputReceived' "$root/Panel.qml"
+grep -q 'onStreamFinished: root.handleActionOutput(text)' "$root/Panel.qml"
+grep -q 'onExited: function(exitCode) { root.handleActionExit(exitCode) }' "$root/Panel.qml"
+grep -q 'Math.round(value / 100) \* 100' "$root/Panel.qml"
+grep -q 'lights.length > 0 || setupAvailable || errorText !== ""' "$root/Panel.qml"
+grep -q 'root.brightnessMixed ? "Mixed"' "$root/Panel.qml"
+grep -q 'root.temperatureMixed ? "Mixed"' "$root/Panel.qml"
+grep -q 'omarchy plugin remove io.github.milofax.keylights' "$root/README.md"
+grep -q 'connection delete uuid' "$root/bin/keylights"
+grep -q 'serial" == "\$expected_id' "$root/bin/keylights"
 
 if rg -n --glob '!tests/run' '192\.168\.1\.|Celtadon|elgato-key-light-[0-9a-f]+\.local' "$root"; then
-  printf 'Private network details found in repository.\n' >&2
-  exit 1
+  fail 'private network details found in repository'
 fi
 
-printf 'Static checks passed.\n'
+mkdir -p -- "$fake_bin"
+
+cat >"$fake_bin/avahi-browse" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${KEYLIGHT_TEST_AVAHI:-ok}" == fail ]]; then exit 1; fi
+printf '=;eth0;IPv4;Elgato\\032Key\\032Light\\032TEST;_elg._tcp;local;test.local;10.0.0.10;9123;"id=discovery-1"\n'
+EOF
+
+cat >"$fake_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+method=GET
+payload=''
+url=''
+while (( $# > 0 )); do
+  case "$1" in
+    --request) method="$2"; shift 2 ;;
+    --data) payload="$2"; shift 2 ;;
+    http://*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+
+[[ "$url" == http://10.0.0.10:9123/* || "$url" == http://192.168.62.1:9123/* ]] || exit 28
+case "$url" in
+  */elgato/accessory-info)
+    printf '%s\n' '{"productName":"Elgato Key Light","serialNumber":"SERIAL-1","features":["lights"]}'
+    ;;
+  */elgato/lights)
+    if [[ "$method" == PUT ]]; then
+      next="$(jq -cn --argjson current "$(<"$KEYLIGHT_TEST_STATE")" --argjson payload "$payload" \
+        '$current * $payload.lights[0]')"
+      printf '%s\n' "$next" >"$KEYLIGHT_TEST_STATE"
+    fi
+    jq -cn --argjson state "$(<"$KEYLIGHT_TEST_STATE")" '{numberOfLights:1,lights:[$state]}'
+    ;;
+  *) exit 22 ;;
+esac
+EOF
+
+cat >"$fake_bin/nmcli" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${KEYLIGHT_TEST_SETUP:-0}" != 1 ]]; then exit 0; fi
+case "$*" in
+  '-t -f DEVICE,TYPE device status') printf 'wlan0:wifi\n' ;;
+  'device wifi rescan ifname wlan0') ;;
+  '-t --escape no -f SSID,SIGNAL device wifi list ifname wlan0 --rescan yes')
+    printf 'Elgato Key Light TEST:90\n'
+    ;;
+  '-g GENERAL.CON-UUID device show wlan0')
+    if [[ "$(<"$KEYLIGHT_TEST_NM_STATE")" == light ]]; then printf 'TEMP-UUID\n'; else printf 'PREV-UUID\n'; fi
+    ;;
+  '-t -f UUID connection show') printf 'PREV-UUID\n' ;;
+  '--wait 20 device wifi connect Elgato Key Light TEST ifname wlan0')
+    printf 'light\n' >"$KEYLIGHT_TEST_NM_STATE"
+    ;;
+  '--wait 20 connection up uuid PREV-UUID ifname wlan0')
+    printf 'restore\n' >>"$KEYLIGHT_TEST_NM_LOG"
+    printf 'previous\n' >"$KEYLIGHT_TEST_NM_STATE"
+    ;;
+  '--wait 10 connection delete uuid TEMP-UUID')
+    printf 'delete\n' >>"$KEYLIGHT_TEST_NM_LOG"
+    ;;
+  *) printf 'unexpected nmcli call: %s\n' "$*" >&2; exit 1 ;;
+esac
+exit 0
+EOF
+
+cat >"$fake_bin/zenity" <<'EOF'
+#!/usr/bin/env bash
+for argument in "$@"; do
+  if [[ "$argument" == --list ]]; then printf 'Elgato Key Light TEST\n'; fi
+done
+exit 0
+EOF
+
+cat >"$fake_bin/xdg-open" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
+cat >"$fake_bin/notify-send" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
+chmod 0755 "$fake_bin/avahi-browse" "$fake_bin/curl" "$fake_bin/nmcli" "$fake_bin/zenity" \
+  "$fake_bin/xdg-open" "$fake_bin/notify-send"
+printf '%s\n' '{"on":0,"brightness":20,"temperature":220}' >"$state_file"
+
+test_path="$fake_bin:$PATH"
+
+status_json="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" "$root/bin/keylights" json)"
+assert_jq "$status_json" '.error == null' 'successful discovery returned an error'
+assert_jq "$status_json" '.lights | length == 1' 'discovery did not return exactly one fixture light'
+assert_jq "$status_json" '.lights[0].id == "SERIAL-1"' 'stable accessory id was not used'
+assert_jq "$status_json" '.lights[0].discoveryId == "discovery-1"' 'mDNS id was not retained for recovery'
+assert_jq "$status_json" '.lights[0].reachable == true' 'fixture light was not reachable'
+
+set +e
+discovery_error="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_AVAHI=fail \
+  "$root/bin/keylights" json 2>/dev/null)"
+discovery_status=$?
+set -e
+[[ "$discovery_status" == 3 ]] || fail 'discovery failure did not return exit 3'
+assert_jq "$discovery_error" '.error | type == "string" and length > 0' 'discovery failure looked like an empty success'
+
+targets='[{"id":"SERIAL-1","discoveryId":"discovery-1","name":"Test Light","address":"10.0.0.10","port":9123}]'
+direct_result="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_AVAHI=fail \
+  "$root/bin/keylights" control status - "$targets")"
+assert_jq "$direct_result" '.failures == 0 and .results[0].ok == true' 'direct control unnecessarily depended on mDNS'
+
+brightness_result="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" \
+  "$root/bin/keylights" control brightness 55 "$targets")"
+assert_jq "$brightness_result" '.results[0].brightness == 55' 'brightness response was not synchronized'
+jq -e '.brightness == 55' "$state_file" >/dev/null || fail 'brightness was not applied by the fixture API'
+
+set +e
+PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" \
+  "$root/bin/keylights" control brightness 101 "$targets" >/dev/null 2>&1
+invalid_status=$?
+set -e
+[[ "$invalid_status" == 2 ]] || fail 'invalid brightness did not return exit 2'
+jq -e '.brightness == 55' "$state_file" >/dev/null || fail 'invalid brightness changed device state'
+
+stale_targets='[{"id":"SERIAL-1","discoveryId":"discovery-1","name":"Test Light","address":"10.0.0.99","port":9123}]'
+recovered_result="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" \
+  "$root/bin/keylights" control status - "$stale_targets")"
+assert_jq "$recovered_result" '.failures == 0 and .results[0].address == "10.0.0.10"' 'stale address was not recovered through mDNS'
+
+nm_state="$work_dir/nm-state"
+nm_log="$work_dir/nm-log"
+printf 'previous\n' >"$nm_state"
+: >"$nm_log"
+PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_SETUP=1 \
+  KEYLIGHT_TEST_NM_STATE="$nm_state" KEYLIGHT_TEST_NM_LOG="$nm_log" \
+  "$root/bin/keylights" setup
+grep -Fxq restore "$nm_log" || fail 'setup did not restore the previous network connection'
+grep -Fxq delete "$nm_log" || fail 'setup did not delete its temporary NetworkManager profile'
+
+printf 'All plugin checks passed.\n'
