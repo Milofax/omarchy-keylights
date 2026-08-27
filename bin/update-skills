@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Synchronize vendored agent skills with their canonical upstream repository."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+REPOSITORY = "https://github.com/mattpocock/skills.git"
+CUSTOM_SKILLS = {
+    "forgimus",
+}
+
+
+def digest_tree(directory: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(directory.rglob("*")):
+        relative = path.relative_to(directory).as_posix()
+        if path.is_dir():
+            continue
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        if path.is_symlink():
+            digest.update(b"link\0")
+            digest.update(os.readlink(path).encode())
+        else:
+            digest.update(b"file\0")
+            digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def load_lock(lock_path: Path) -> dict:
+    if not lock_path.exists():
+        return {"version": 1, "upstream": {}, "skills": {}}
+    return json.loads(lock_path.read_text(encoding="utf-8"))
+
+
+def skill_sources(checkout: Path) -> dict[str, Path]:
+    sources: dict[str, Path] = {}
+    for skill_file in sorted((checkout / "skills").glob("*/*/SKILL.md")):
+        directory = skill_file.parent
+        name = directory.name
+        if name in CUSTOM_SKILLS:
+            raise RuntimeError(f"Upstream skill collides with project skill: {name}")
+        if name in sources:
+            raise RuntimeError(f"Duplicate upstream skill name: {name}")
+        sources[name] = directory
+    if not sources:
+        raise RuntimeError("No upstream skills found")
+    return sources
+
+
+def rebuild_claude_links(skills_dir: Path, links_dir: Path) -> None:
+    links_dir.mkdir(parents=True, exist_ok=True)
+    expected = {path.name for path in skills_dir.iterdir() if path.is_dir()}
+    for path in links_dir.iterdir():
+        if path.name not in expected or path.is_symlink():
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+    for name in sorted(expected):
+        link = links_dir / name
+        target = f"../../.agents/skills/{name}"
+        if link.is_symlink() and os.readlink(link) == target:
+            continue
+        if link.exists() or link.is_symlink():
+            if link.is_dir() and not link.is_symlink():
+                shutil.rmtree(link)
+            else:
+                link.unlink()
+        link.symlink_to(target)
+
+
+def verify(root: Path) -> list[str]:
+    errors: list[str] = []
+    skills_dir = root / ".agents" / "skills"
+    links_dir = root / ".claude" / "skills"
+    lock = load_lock(root / "skills-lock.json")
+    locked = lock.get("skills", {})
+    project_locked = lock.get("projectSkills", {})
+    if isinstance(project_locked, list):
+        project_locked = {name: {} for name in project_locked}
+    if set(project_locked) != CUSTOM_SKILLS:
+        errors.append(
+            f"project skill lock differs: missing={sorted(CUSTOM_SKILLS - set(project_locked))}, "
+            f"unexpected={sorted(set(project_locked) - CUSTOM_SKILLS)}"
+        )
+    expected = set(locked) | set(project_locked)
+    actual = {path.name for path in skills_dir.iterdir() if path.is_dir()}
+    if actual != expected:
+        errors.append(
+            f"skill set differs: missing={sorted(expected - actual)}, "
+            f"unexpected={sorted(actual - expected)}"
+        )
+    for name, metadata in sorted(locked.items()):
+        directory = skills_dir / name
+        if directory.is_dir():
+            current = digest_tree(directory)
+            if current != metadata.get("sha256"):
+                errors.append(f"content hash differs: {name}")
+    for name, metadata in sorted(project_locked.items()):
+        directory = skills_dir / name
+        if directory.is_dir():
+            current = digest_tree(directory)
+            if current != metadata.get("sha256"):
+                errors.append(f"project skill content hash differs: {name}")
+    # Claude aliases are generated locally and intentionally not committed:
+    # Omarchy rejects plugins containing symlinks. Verify them when present,
+    # while still allowing --check to work in a fresh repository clone.
+    if links_dir.exists():
+        actual_links = {path.name for path in links_dir.iterdir()}
+        if actual_links != expected:
+            errors.append(
+                f"Claude link set differs: missing={sorted(expected - actual_links)}, "
+                f"unexpected={sorted(actual_links - expected)}"
+            )
+        for name in sorted(expected):
+            link = links_dir / name
+            target = f"../../.agents/skills/{name}"
+            if not link.is_symlink() or os.readlink(link) != target:
+                errors.append(f"invalid Claude skill link: {name}")
+    return errors
+
+
+def update(root: Path, ref: str) -> None:
+    skills_dir = root / ".agents" / "skills"
+    links_dir = root / ".claude" / "skills"
+    lock_path = root / "skills-lock.json"
+    old_lock = load_lock(lock_path)
+
+    with tempfile.TemporaryDirectory(prefix="spielarchiv-skills-") as temp:
+        checkout = Path(temp) / "upstream"
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        subprocess.run(
+            ["git", "-C", str(checkout), "fetch", "-q", "--depth", "1", REPOSITORY, ref],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(checkout), "checkout", "-q", "--detach", "FETCH_HEAD"],
+            check=True,
+        )
+        revision = subprocess.check_output(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True
+        ).strip()
+        sources = skill_sources(checkout)
+
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        old_upstream = set(old_lock.get("skills", {}))
+        for name in sorted(old_upstream | set(sources)):
+            destination = skills_dir / name
+            if destination.exists():
+                shutil.rmtree(destination)
+        for name, source in sorted(sources.items()):
+            shutil.copytree(source, skills_dir / name, symlinks=True)
+
+        missing_custom = [name for name in sorted(CUSTOM_SKILLS) if not (skills_dir / name).is_dir()]
+        if missing_custom:
+            raise RuntimeError(f"Missing project-owned skills: {', '.join(missing_custom)}")
+
+        rebuild_claude_links(skills_dir, links_dir)
+        lock = {
+            "version": 1,
+            "upstream": {"repository": REPOSITORY, "revision": revision},
+            "skills": {
+                name: {
+                    "path": source.relative_to(checkout).as_posix(),
+                    "sha256": digest_tree(skills_dir / name),
+                }
+                for name, source in sorted(sources.items())
+            },
+            "projectSkills": {
+                name: {"sha256": digest_tree(skills_dir / name)}
+                for name in sorted(CUSTOM_SKILLS)
+            },
+        }
+        lock_path.write_text(json.dumps(lock, indent=2) + "\n", encoding="utf-8")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check", action="store_true", help="verify vendored skills without network access")
+    parser.add_argument("--ref", default="HEAD", help="upstream branch, tag, or commit to fetch")
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parent.parent
+
+    if not args.check:
+        update(root, args.ref)
+    errors = verify(root)
+    if errors:
+        for error in errors:
+            print(f"error: {error}", file=sys.stderr)
+        return 1
+    lock = load_lock(root / "skills-lock.json")
+    print(
+        f"skills ok: {len(lock['skills'])} upstream + "
+        f"{len(lock['projectSkills'])} project-owned"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,14 @@
+interface:
+  display_name: Forgimus
+  short_description: Survey the work, then prepare, publish, merge, or clean up
+  default_prompt: Use $forgimus to survey what is open and what is in flight, or add
+    prepare, publish, merge, or cleanup to carry one ticket through that phase.
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  allow_implicit_invocation: false
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas

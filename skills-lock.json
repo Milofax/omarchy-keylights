@@ -1,0 +1,162 @@
+{
+  "version": 1,
+  "upstream": {
+    "repository": "https://github.com/mattpocock/skills.git",
+    "revision": "6654f6b60cd9d5be8b54c6fafe44346dabeb3b76"
+  },
+  "skills": {
+    "ask-matt": {
+      "path": "skills/engineering/ask-matt",
+      "sha256": "0948384efda8ccccf7b4f5e76820f75adcbf10927da9c57ec813961b781a073a"
+    },
+    "claude-handoff": {
+      "path": "skills/in-progress/claude-handoff",
+      "sha256": "7dbc005330d981038dddb8dc320da7823000e48cd4fbe560526be7c548dafcd7"
+    },
+    "code-review": {
+      "path": "skills/engineering/code-review",
+      "sha256": "04424a8bec4c65d92f22d8964f7bf7e364d9b0cdc4fe49fbc90a153fe92690fd"
+    },
+    "codebase-design": {
+      "path": "skills/engineering/codebase-design",
+      "sha256": "aba086967aaadf6070097658fd98494668b8bd698a3f2c4d9e4dbad30f92681c"
+    },
+    "diagnosing-bugs": {
+      "path": "skills/engineering/diagnosing-bugs",
+      "sha256": "a5cc9d6fd1300135f5999e1a1f3e7994f278661342a992a997962853bebd43c1"
+    },
+    "domain-modeling": {
+      "path": "skills/engineering/domain-modeling",
+      "sha256": "1d37c03520a99837dd1ec4e63ebaf45cb672e1479a4aa27ffc7e079af4bffb28"
+    },
+    "git-guardrails-claude-code": {
+      "path": "skills/misc/git-guardrails-claude-code",
+      "sha256": "5d09ef44d16d91dd19ef6976ba7f2e2253510ef8a58b0520fdb17e897ffc6734"
+    },
+    "grill-me": {
+      "path": "skills/productivity/grill-me",
+      "sha256": "8754d4246cd62ec1860b5b3f11e8ad7b8897a7106f080e3bc2e2e6edeb4f3d39"
+    },
+    "grill-with-docs": {
+      "path": "skills/engineering/grill-with-docs",
+      "sha256": "21fa7fdcfa9633c6bc37ec6bc19c7131dba96157d5b7b89be590ab682684926f"
+    },
+    "grilling": {
+      "path": "skills/productivity/grilling",
+      "sha256": "9bbb6798290e135bf844205d0e3a63c22c55fc044181d8b9e821ecaa6bdaea0b"
+    },
+    "handoff": {
+      "path": "skills/productivity/handoff",
+      "sha256": "e4b7761275ccb069ce6ececeb0029d7a75e25937934da38451a7052ee7129307"
+    },
+    "implement": {
+      "path": "skills/engineering/implement",
+      "sha256": "7f7d05860a5dfa5eb0801d9ead1a12bb77cbc6b9c46a502175d199ea3a632be7"
+    },
+    "implement-spec": {
+      "path": "skills/in-progress/implement-spec",
+      "sha256": "17c379588481d262f3a963f92e0283beea14abcafb4abbb46a9b56079bd2451e"
+    },
+    "improve-codebase-architecture": {
+      "path": "skills/engineering/improve-codebase-architecture",
+      "sha256": "94221594f3231318588e2622a4f3544acee500859daa833ba62c69bb7c0c737f"
+    },
+    "loop-me": {
+      "path": "skills/in-progress/loop-me",
+      "sha256": "55b2b70c0a7f944ecc407967df35b3f92b94d478469d3df0de46dc962296caf1"
+    },
+    "migrate-to-shoehorn": {
+      "path": "skills/misc/migrate-to-shoehorn",
+      "sha256": "5855aeaa25a77ab35a6b20c93a37948f414aeb46aa21d5c4645f461b0ed69f07"
+    },
+    "prototype": {
+      "path": "skills/engineering/prototype",
+      "sha256": "88fdf8ccbd9a7650a8908673b258f3ee45064b0a3036f16bd91f810d95dd3c21"
+    },
+    "research": {
+      "path": "skills/engineering/research",
+      "sha256": "206ba558ed17f952abc06f1b28e5d4d58971ae1c0da7dc2c732a81291a30c173"
+    },
+    "resolving-merge-conflicts": {
+      "path": "skills/engineering/resolving-merge-conflicts",
+      "sha256": "804b0c0bf378750983d786d09be2e5d36aeec569460d2b13dc55b7538072814d"
+    },
+    "retro": {
+      "path": "skills/in-progress/retro",
+      "sha256": "0130147496066780ed03e1f9bedc17b64b754009caf711dc2e79d8ca0ff1aba1"
+    },
+    "scaffold-exercises": {
+      "path": "skills/misc/scaffold-exercises",
+      "sha256": "a016762d9baca28016751820576b6f0e942d15c15fc9808343ad529dad981785"
+    },
+    "setup-matt-pocock-skills": {
+      "path": "skills/engineering/setup-matt-pocock-skills",
+      "sha256": "1ad0603d5ae468e5788a7b3204481e06dc91e8efe1097166a392278abb1d7702"
+    },
+    "setup-pre-commit": {
+      "path": "skills/misc/setup-pre-commit",
+      "sha256": "693331dbacab1803166f390a229e7c68f3cc669cd6f3d4c2c095ebf5cfefd127"
+    },
+    "setup-ts-deep-modules": {
+      "path": "skills/in-progress/setup-ts-deep-modules",
+      "sha256": "172f98642f585c2ea18fea3f53e07c0a6a9a79c8d96bf09ffefa1c061f55d404"
+    },
+    "tdd": {
+      "path": "skills/engineering/tdd",
+      "sha256": "0f28f7f925eca2372c6dd545cfd95f9f5b86c088ed41fb64612a61b95276c291"
+    },
+    "teach": {
+      "path": "skills/productivity/teach",
+      "sha256": "a1876d9796bc6385f68ac2f8a19ba1e8b87aa8a01377d90f782c890920913170"
+    },
+    "to-questionnaire": {
+      "path": "skills/productivity/to-questionnaire",
+      "sha256": "784699bc9e230e633665608295f297d1fbcc3e3070dda96a2d927a70b5db1ee4"
+    },
+    "to-spec": {
+      "path": "skills/engineering/to-spec",
+      "sha256": "3cb84b93ef6218608cb96fe445d367cb674946cc982b5b1093926ccebadbec39"
+    },
+    "to-tickets": {
+      "path": "skills/engineering/to-tickets",
+      "sha256": "19d3f9c3f6e64ba1e251dac87daadf4b46387292b5024d12500e41536576ed09"
+    },
+    "triage": {
+      "path": "skills/engineering/triage",
+      "sha256": "5eac3ca2ac90e468182161e277b1e6d6903a1d32d0ff989536c05a14cc3965be"
+    },
+    "wait-what": {
+      "path": "skills/productivity/wait-what",
+      "sha256": "02244babb1f67372a07c24cd2159f921de2321534b73289cd8bbae57d47a3fe3"
+    },
+    "wayfinder": {
+      "path": "skills/engineering/wayfinder",
+      "sha256": "a4c779183d02e66252642afa449391be3f647c2b37e61cd0087678db3ee41e2e"
+    },
+    "wizard": {
+      "path": "skills/engineering/wizard",
+      "sha256": "10a12ad3a406996320aad1e7312495f41bc73ee0468211af9c817a63eda5b753"
+    },
+    "writing-beats": {
+      "path": "skills/in-progress/writing-beats",
+      "sha256": "d7f0b62fb74d093b3e050c265b40575caf5948906f27484a63ec18e91f98ac0c"
+    },
+    "writing-for-agents": {
+      "path": "skills/productivity/writing-for-agents",
+      "sha256": "fcb10db87df86261e200c97a91e68167cac82ee1880b99f1579424710d159a28"
+    },
+    "writing-fragments": {
+      "path": "skills/in-progress/writing-fragments",
+      "sha256": "77fc9e2266213e1ebde1135992db94b528d5df758009c76672b8b45399a61901"
+    },
+    "writing-shape": {
+      "path": "skills/in-progress/writing-shape",
+      "sha256": "65994ec0e3c0d0f78b1fdebf089939a08ea36ca725471bd64400366ee797fd32"
+    }
+  },
+  "projectSkills": {
+    "forgimus": {
+      "sha256": "14d701e486526fabcb8ab97c57d52ec6dac8d246614a7c368dc0f3e1879d6735"
+    }
+  }
+}
