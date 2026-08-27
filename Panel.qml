@@ -1,9 +1,12 @@
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "KeyLightsLogic.js" as Logic
 
 Panel {
   id: root
@@ -12,6 +15,7 @@ Panel {
   manageIpc: false
 
   readonly property string tool: decodeURIComponent(String(Qt.resolvedUrl("bin/keylights")).replace(/^file:\/\//, ""))
+  readonly property string trayTool: decodeURIComponent(String(Qt.resolvedUrl("bin/keylights-tray")).replace(/^file:\/\//, ""))
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
@@ -21,13 +25,30 @@ Panel {
   property bool setupAvailable: false
   property bool setupSupported: false
   property string errorText: ""
+  property string noticeText: ""
   property var commandQueue: []
   property var activeCommand: null
   property bool actionExitReceived: false
   property bool actionOutputReceived: false
+  property bool actionErrorReceived: false
   property int actionExitCode: 0
   property string actionOutputText: ""
+  property string actionErrorText: ""
+  property bool statusInFlight: false
+  property bool statusExitReceived: false
+  property bool statusOutputReceived: false
+  property bool statusErrorReceived: false
+  property int statusExitCode: 0
+  property string statusOutputText: ""
+  property string statusErrorText: ""
   property bool refreshPending: false
+  property bool trayMode: true
+  property int trayWantedConfirmations: 0
+  property bool trayStopRequested: false
+  property bool trayTerminal: false
+  property int trayRetryCount: 0
+  readonly property int trayRetryLimit: 3
+  property string trayErrorText: ""
 
   readonly property int reachableCount: {
     var count = 0
@@ -43,66 +64,43 @@ Panel {
   readonly property bool anyReachable: reachableCount > 0
   readonly property bool allReachable: lights.length > 0 && reachableCount === lights.length
   readonly property bool anyOn: onCount > 0
-  readonly property bool missing: errorText !== "" || setupAvailable || (lights.length > 0 && !allReachable)
-  readonly property int brightnessPercent: {
-    var total = 0
-    var count = 0
-    for (var i = 0; i < lights.length; i++) {
-      if (lights[i].reachable !== true) continue
-      total += Number(lights[i].brightness || 20)
-      count++
-    }
-    return count > 0 ? Math.round(total / count) : 20
-  }
-  readonly property bool brightnessMixed: {
-    var first = -1
-    for (var i = 0; i < lights.length; i++) {
-      if (lights[i].reachable !== true) continue
-      var value = Math.round(Number(lights[i].brightness || 20))
-      if (first < 0) first = value
-      else if (value !== first) return true
-    }
-    return false
-  }
-  readonly property int temperatureKelvin: {
-    var total = 0
-    var count = 0
-    for (var i = 0; i < lights.length; i++) {
-      if (lights[i].reachable !== true) continue
-      total += Math.round((1000000 / Math.max(143, Number(lights[i].temperature || 213))) / 100) * 100
-      count++
-    }
-    return count > 0 ? Math.round((total / count) / 100) * 100 : 4700
-  }
-  readonly property bool temperatureMixed: {
-    var first = -1
-    for (var i = 0; i < lights.length; i++) {
-      if (lights[i].reachable !== true) continue
-      var value = Math.round((1000000 / Math.max(143, Number(lights[i].temperature || 213))) / 100) * 100
-      if (first < 0) first = value
-      else if (value !== first) return true
-    }
-    return false
-  }
+  readonly property bool trayWanted: Logic.trayWanted(lights)
+  readonly property bool trayUnavailable: trayMode && trayErrorText !== ""
+  readonly property bool missing: errorText !== "" || trayUnavailable || setupAvailable || (lights.length > 0 && !allReachable)
+  readonly property var brightnessState: Logic.brightnessSummary(lights)
+  readonly property int brightnessPercent: Number(brightnessState.value)
+  readonly property bool brightnessMixed: brightnessState.mixed === true
+  readonly property var temperatureState: Logic.temperatureSummary(lights)
+  readonly property int temperatureKelvin: Number(temperatureState.value)
+  readonly property bool temperatureMixed: temperatureState.mixed === true
   readonly property bool settingsMixed: brightnessMixed || temperatureMixed
   readonly property string stateSummary: {
     if (lights.length === 0 && errorText !== "") return "Discovery error"
+    if (trayUnavailable) return "Tray unavailable"
     if (lights.length === 0 && setupAvailable) return "Ready to set up"
     if (!anyReachable) return "Not reachable"
     var status = onCount === 0 ? "Off" : (onCount === reachableCount ? "On" : onCount + " of " + reachableCount + " on")
     return settingsMixed ? status + " · Mixed settings" : status + " · " + brightnessPercent + "% · " + temperatureKelvin + " K"
   }
 
-  visible: lights.length > 0 || setupAvailable || errorText !== ""
+  visible: !trayMode || trayUnavailable
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
   function refresh() {
-    if (statusProcess.running || actionProcess.running || commandQueue.length > 0 || setupProcess.running) {
+    if (Logic.operationBusy(statusInFlight, actionProcess.running, setupProcess.running,
+                            commandQueue.length, activeCommand)) {
       refreshPending = true
       return
     }
     refreshPending = false
+    statusInFlight = true
+    statusExitReceived = false
+    statusOutputReceived = false
+    statusErrorReceived = false
+    statusExitCode = 0
+    statusOutputText = ""
+    statusErrorText = ""
     statusProcess.running = true
   }
 
@@ -116,10 +114,11 @@ Panel {
         return
       }
 
-      var nextLights = parsed.lights instanceof Array ? parsed.lights : []
+      var nextLights = Logic.reconcileLights(lights, parsed.lights instanceof Array ? parsed.lights : [])
       var reachable = 0
       for (var i = 0; i < nextLights.length; i++) if (nextLights[i].reachable === true) reachable++
       lights = nextLights
+      noticeText = ""
       errorText = nextLights.length > 0 && reachable < nextLights.length
         ? "One or more lights are not reachable."
         : ""
@@ -176,14 +175,17 @@ Panel {
   }
 
   function startNextCommand() {
-    if (actionProcess.running || commandQueue.length === 0) return
-    var next = commandQueue[0]
-    commandQueue = commandQueue.slice(1)
+    if (actionProcess.running || activeCommand !== null || commandQueue.length === 0) return
+    var dequeued = Logic.dequeueCommand(commandQueue)
+    var next = dequeued.command
+    commandQueue = dequeued.remaining
     activeCommand = next
     actionExitReceived = false
     actionOutputReceived = false
+    actionErrorReceived = false
     actionExitCode = 0
     actionOutputText = ""
+    actionErrorText = ""
     actionProcess.command = [
       tool,
       "control",
@@ -221,7 +223,7 @@ Panel {
 
     applyOptimistic(target, action, value)
     errorText = ""
-    commandQueue = commandQueue.concat([{targets: targets, action: action, value: value}])
+    commandQueue = Logic.enqueueCommand(commandQueue, {targets: targets, action: action, value: value})
     startNextCommand()
   }
 
@@ -254,6 +256,7 @@ Panel {
           temperature: result.temperature !== undefined ? Number(result.temperature) : Number(light.temperature || 213)
         })
       }
+      commandQueue = Logic.refreshQueuedTargets(commandQueue, results)
       lights = next
       reapplyQueuedOptimism()
     } catch (error) {
@@ -262,11 +265,12 @@ Panel {
   }
 
   function finishActionIfReady() {
-    if (!activeCommand || !actionExitReceived || !actionOutputReceived) return
+    if (!Logic.operationReady(activeCommand, actionExitReceived, actionOutputReceived) || !actionErrorReceived) return
 
     if (actionOutputText.trim() !== "") applyControlResult(actionOutputText)
-    else errorText = "The Key Light command returned no status."
-    if (actionExitCode !== 0) errorText = "One or more lights did not respond. Please try again."
+    else errorText = firstErrorLine(actionErrorText, "The Key Light command returned no status.")
+    if (actionExitCode !== 0 && (actionOutputText.trim() !== "" || actionErrorText.trim() === ""))
+      errorText = Logic.actionError(actionExitCode)
 
     activeCommand = null
     if (commandQueue.length > 0) {
@@ -280,6 +284,12 @@ Panel {
   function handleActionOutput(output) {
     actionOutputText = String(output || "")
     actionOutputReceived = true
+    finishActionIfReady()
+  }
+
+  function handleActionError(output) {
+    actionErrorText = String(output || "")
+    actionErrorReceived = true
     finishActionIfReady()
   }
 
@@ -302,8 +312,9 @@ Panel {
   }
 
   function startSetup() {
-    if (setupProcess.running || statusProcess.running || actionProcess.running || commandQueue.length > 0) {
-      errorText = "Wait for the current Key Light operation to finish."
+    if (Logic.operationBusy(statusInFlight, actionProcess.running, setupProcess.running,
+                            commandQueue.length, activeCommand)) {
+      noticeText = "Wait for the current Key Light operation to finish."
       return
     }
     if (!setupSupported) {
@@ -311,15 +322,126 @@ Panel {
       return
     }
     setupProcess.running = true
+    noticeText = ""
     close()
   }
 
-  Component.onCompleted: refresh()
+  function adjustBrightness(delta) {
+    if (!anyReachable || delta === 0) return
+    var next = Math.max(1, Math.min(100, brightnessPercent + (delta > 0 ? 5 : -5)))
+    runCommand("all", "brightness", next)
+  }
+
+  function firstErrorLine(output, fallback) {
+    var lines = String(output || "").trim().split(/\r?\n/)
+    return lines.length > 0 && lines[0] !== "" ? lines[0] : fallback
+  }
+
+  function finishStatusIfReady() {
+    if (!Logic.operationReady(statusInFlight, statusExitReceived, statusOutputReceived) || !statusErrorReceived) return
+
+    if (statusOutputText.trim() !== "") applyStatus(statusOutputText)
+    else errorText = statusExitCode === 0
+      ? "Could not read the Key Light status."
+      : firstErrorLine(statusErrorText, "Could not discover Key Lights.")
+    statusInFlight = false
+    if (statusExitCode !== 0 && errorText === "") errorText = "Could not discover Key Lights."
+    if (refreshPending && !actionProcess.running && activeCommand === null) Qt.callLater(refresh)
+  }
+
+  function handleStatusOutput(output) {
+    statusOutputText = String(output || "")
+    statusOutputReceived = true
+    finishStatusIfReady()
+  }
+
+  function handleStatusError(output) {
+    statusErrorText = String(output || "")
+    statusErrorReceived = true
+    finishStatusIfReady()
+  }
+
+  function handleStatusExit(exitCode) {
+    statusExitCode = exitCode
+    statusExitReceived = true
+    finishStatusIfReady()
+  }
+
+  function recordTrayPreference() {
+    var next = Logic.advanceTrayMode(trayMode, trayWanted, trayWantedConfirmations)
+    trayWantedConfirmations = Number(next.confirmations)
+    trayMode = next.trayMode === true
+  }
+
+  function syncTrayProcess() {
+    if (trayMode) {
+      if (!trayTerminal && !trayStopRequested && !trayProcess.running && !trayRetry.running)
+        trayProcess.running = true
+    } else {
+      trayRetry.stop()
+      trayHealthy.stop()
+      trayTerminal = false
+      trayRetryCount = 0
+      trayErrorText = ""
+      if (trayProcess.running) {
+        trayStopRequested = true
+        trayProcess.running = false
+      }
+    }
+  }
+
+  function scheduleTrayRetry(message, terminalMessage) {
+    trayRetryCount++
+    if (trayRetryCount >= trayRetryLimit) {
+      trayTerminal = true
+      trayErrorText = terminalMessage !== ""
+        ? terminalMessage
+        : "System tray support stopped repeatedly. Check the Omarchy shell log."
+      return
+    }
+    trayErrorText = message
+    trayRetry.restart()
+  }
+
+  function handleTrayExit(exitCode) {
+    var action = Logic.trayExitAction(exitCode, trayStopRequested, trayMode)
+    trayStopRequested = false
+    if (action === "ignore") {
+      if (trayMode) Qt.callLater(syncTrayProcess)
+      return
+    }
+    if (action === "missing-dependency") {
+      trayTerminal = true
+      trayErrorText = "System tray support requires python-dbus and python-gobject."
+      return
+    }
+    if (action === "session-bus") {
+      scheduleTrayRetry(
+        "The session D-Bus is unavailable; tray support will retry.",
+        "The session D-Bus remained unavailable; tray support stopped retrying."
+      )
+      return
+    }
+    scheduleTrayRetry("", "")
+  }
+
+  Component.onCompleted: {
+    refresh()
+    syncTrayProcess()
+  }
+  Component.onDestruction: {
+    trayRetry.stop()
+    trayHealthy.stop()
+    trayStopRequested = true
+    trayProcess.running = false
+  }
   onOpenedChanged: if (opened) refresh()
+  onLightsChanged: recordTrayPreference()
+  onTrayModeChanged: Qt.callLater(syncTrayProcess)
 
   Timer {
     interval: root.opened ? 5000 : 15000
-    running: true
+    running: Logic.shouldPoll(root.opened, root.lights)
     repeat: true
     onTriggered: root.refresh()
   }
@@ -330,12 +452,42 @@ Panel {
     command: [root.tool, "json"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applyStatus(text)
+      onStreamFinished: root.handleStatusOutput(text)
     }
-    onExited: function(exitCode) {
-      if (exitCode !== 0 && root.errorText === "") root.errorText = "Could not discover Key Lights."
-      if (root.refreshPending && !actionProcess.running) Qt.callLater(root.refresh)
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.handleStatusError(text)
     }
+    onExited: function(exitCode) { root.handleStatusExit(exitCode) }
+  }
+
+  Timer {
+    id: trayRetry
+    interval: Math.min(60000, 10000 * Math.max(1, root.trayRetryCount))
+    repeat: false
+    onTriggered: root.syncTrayProcess()
+  }
+
+  Timer {
+    id: trayHealthy
+    interval: 60000
+    repeat: false
+    onTriggered: root.trayRetryCount = 0
+  }
+
+  Process {
+    id: trayProcess
+    running: false
+    command: [root.trayTool]
+    onRunningChanged: {
+      if (running) {
+        root.trayErrorText = ""
+        trayHealthy.restart()
+      } else {
+        trayHealthy.stop()
+      }
+    }
+    onExited: function(exitCode) { root.handleTrayExit(exitCode) }
   }
 
   Process {
@@ -345,7 +497,10 @@ Panel {
       waitForEnd: true
       onStreamFinished: root.handleActionOutput(text)
     }
-    stderr: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.handleActionError(text)
+    }
     onExited: function(exitCode) { root.handleActionExit(exitCode) }
   }
 
@@ -371,6 +526,8 @@ Panel {
     function lightsOn(): string { root.runCommand("all", "on"); return "ok" }
     function lightsOff(): string { root.runCommand("all", "off"); return "ok" }
     function toggleAll(): string { root.runCommand("all", "toggle"); return "ok" }
+    function brightnessUp(): string { root.adjustBrightness(1); return "ok" }
+    function brightnessDown(): string { root.adjustBrightness(-1); return "ok" }
     function state(): string {
       return JSON.stringify({
         visible: root.visible,
@@ -378,7 +535,7 @@ Panel {
         on: root.anyOn,
         lights: root.lights,
         setupAvailable: root.setupAvailable,
-        error: root.errorText
+        error: root.errorText !== "" ? root.errorText : root.trayErrorText
       })
     }
   }
@@ -393,7 +550,7 @@ Panel {
         iconSize: Style.bar.iconFont
         iconColor: root.barForeground
         lit: root.anyOn
-        crossed: !root.anyOn && root.allReachable
+        crossed: Logic.connectionLost(root.lights)
         missing: root.missing
       }
     }
@@ -404,9 +561,7 @@ Panel {
       else root.toggle()
     }
     onWheelMoved: function(delta) {
-      if (!root.anyReachable || delta === 0) return
-      var next = Math.max(1, Math.min(100, root.brightnessPercent + (delta > 0 ? 5 : -5)))
-      root.runCommand("all", "brightness", next)
+      root.adjustBrightness(delta)
     }
   }
 
@@ -452,7 +607,7 @@ Panel {
               iconSize: Style.font.heading
               iconColor: root.foreground
               lit: root.anyOn
-              crossed: !root.anyOn && root.allReachable
+              crossed: Logic.connectionLost(root.lights)
               missing: root.missing
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
@@ -504,6 +659,7 @@ Panel {
 
                 Text {
                   text: root.lightLabel(modelData)
+                  textFormat: Text.PlainText
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
@@ -514,6 +670,7 @@ Panel {
 
                 Text {
                   text: root.lightStatus(modelData)
+                  textFormat: Text.PlainText
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -630,7 +787,30 @@ Panel {
           Text {
             visible: root.errorText !== ""
             text: root.errorText
+            textFormat: Text.PlainText
             color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            width: parent.width
+            wrapMode: Text.WordWrap
+          }
+
+          Text {
+            visible: root.trayErrorText !== ""
+            text: root.trayErrorText
+            textFormat: Text.PlainText
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            width: parent.width
+            wrapMode: Text.WordWrap
+          }
+
+          Text {
+            visible: root.noticeText !== ""
+            text: root.noticeText
+            textFormat: Text.PlainText
+            color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             width: parent.width
@@ -701,7 +881,7 @@ Panel {
     }
 
     Text {
-      visible: parent.missing
+      visible: parent.missing && !parent.crossed
       text: "×"
       color: parent.iconColor
       font.family: root.fontFamily

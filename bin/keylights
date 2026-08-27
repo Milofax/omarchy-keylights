@@ -4,12 +4,14 @@ set -uo pipefail
 readonly API_ROOT="/elgato"
 readonly API_PATH="$API_ROOT/lights"
 readonly INFO_PATH="$API_ROOT/accessory-info"
+readonly MAX_PARALLEL=8
 
 usage() {
   cat <<'EOF'
 Usage:
   keylights json
   keylights setup
+  keylights control ACTION VALUE TARGETS_JSON
   keylights [all|DEVICE_ID] status
   keylights [all|DEVICE_ID] on|off|toggle
   keylights [all|DEVICE_ID] brightness <1-100>
@@ -30,10 +32,17 @@ require_runtime() {
 }
 
 decode_avahi() {
-  local value="$1"
-  value="${value//\\032/ }"
-  value="${value//\\046/&}"
-  value="${value//\\092/\\}"
+  local value="$1" escape digits decimal encoded decoded
+
+  while [[ "$value" =~ \\([0-9]{3}) ]]; do
+    escape="${BASH_REMATCH[0]}"
+    digits="${BASH_REMATCH[1]}"
+    decimal=$((10#$digits))
+    (( decimal > 0 && decimal <= 255 )) || break
+    printf -v encoded '\\%03o' "$decimal"
+    printf -v decoded '%b' "$encoded"
+    value="${value/"$escape"/"$decoded"}"
+  done
   printf '%s' "$value"
 }
 
@@ -73,8 +82,14 @@ discover_rows() {
     name="$(decode_avahi "$service_name")"
     id="$(sed -n 's/.*"id=\([^"]*\)".*/\1/p' <<<"$txt")"
     [[ -n "$id" ]] || id="$host"
+    name="${name//$'\t'/ }"
+    name="${name//$'\r'/ }"
+    name="${name//$'\n'/ }"
+    id="${id//$'\t'/ }"
+    id="${id//$'\r'/ }"
+    id="${id//$'\n'/ }"
     printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$name" "$address" "$port" "$host"
-  done <<<"$browse_output" | awk -F '\t' '!seen[$1]++' | sort -t $'\t' -k2,2 -k1,1
+  done <<<"$browse_output" | awk -F '\t' '!seen[$1]++'
 }
 
 setup_supported() {
@@ -83,7 +98,7 @@ setup_supported() {
 
 setup_available() {
   setup_supported || return 1
-  nmcli -t --escape no -f SSID device wifi list --rescan auto 2>/dev/null |
+  nmcli -t --escape no -f SSID device wifi list --rescan no 2>/dev/null |
     grep -Eq '^Elgato (Key|Ring) Light([[:space:]]|$)'
 }
 
@@ -164,6 +179,8 @@ perform_action() {
       ;;
     temperature)
       local mired=$(((1000000 + value / 2) / value))
+      (( mired > 344 )) && mired=344
+      (( mired < 143 )) && mired=143
       payload="$(jq -cn --argjson temperature "$mired" '{temperature:$temperature}')"
       set_state "$address" "$port" "$payload"
       ;;
@@ -198,9 +215,9 @@ probe_device() {
     '{id:$id,discoveryId:$discoveryId,name:$name,product:$product,host:$host,address:$address,port:$port,reachable:false}'
 }
 
-json_status() {
+json_status() (
   local rows setup=false supported=false work_dir output_file lights='[]'
-  local id name address port host index=0
+  local id name address port host index=0 pid_index
   local -a pids=() files=()
 
   setup_supported && supported=true
@@ -214,6 +231,7 @@ json_status() {
   fi
 
   work_dir="$(mktemp -d)" || return 1
+  trap 'rm -rf -- "$work_dir"' EXIT
   while IFS=$'\t' read -r id name address port host; do
     [[ -n "$id" ]] || continue
     index=$((index + 1))
@@ -221,23 +239,25 @@ json_status() {
     files+=("$output_file")
     probe_device "$id" "$name" "$address" "$port" "$host" >"$output_file" &
     pids+=("$!")
+    if (( ${#pids[@]} >= MAX_PARALLEL )); then
+      for pid_index in "${!pids[@]}"; do
+        wait "${pids[$pid_index]}" || true
+      done
+      pids=()
+    fi
   done <<<"$rows"
 
-  for index in "${!pids[@]}"; do
-    wait "${pids[$index]}" || true
+  for pid_index in "${!pids[@]}"; do
+    wait "${pids[$pid_index]}" || true
   done
 
   if (( ${#files[@]} > 0 )); then
-    lights="$(jq -sc 'sort_by(.name, .id)' "${files[@]}")" || {
-      rm -r -- "$work_dir"
-      return 1
-    }
+    lights="$(jq -sc 'sort_by(.name, .id)' "${files[@]}")" || return 1
   fi
-  rm -r -- "$work_dir"
 
   jq -cn --argjson lights "$lights" --argjson setup "$setup" --argjson supported "$supported" \
     '{lights:$lights,setupAvailable:$setup,setupSupported:$supported,error:null}'
-}
+)
 
 validate_targets() {
   local targets="$1" address port
@@ -309,9 +329,9 @@ control_target() {
   return 1
 }
 
-control_targets() {
+control_targets() (
   local action="$1" value="$2" targets="$3" work_dir output_file
-  local id discovery_id name address port index=0 failures=0 status
+  local id discovery_id name address port index=0 pid_index failures=0 status
   local -a pids=() files=()
 
   [[ "$value" == '-' ]] && value=""
@@ -325,30 +345,44 @@ control_targets() {
   }
 
   work_dir="$(mktemp -d)" || return 1
+  trap 'rm -rf -- "$work_dir"' EXIT
   while IFS=$'\t' read -r id discovery_id name address port; do
     index=$((index + 1))
     output_file="$work_dir/$index.json"
     files+=("$output_file")
     control_target "$id" "$discovery_id" "$name" "$address" "$port" "$action" "$value" >"$output_file" &
     pids+=("$!")
+    if (( ${#pids[@]} >= MAX_PARALLEL )); then
+      for pid_index in "${!pids[@]}"; do
+        status=0
+        wait "${pids[$pid_index]}" || status=$?
+        (( status == 0 )) || failures=$((failures + 1))
+      done
+      pids=()
+    fi
   done < <(jq -r '.[] | [.id, .discoveryId, .name, .address, (.port | tostring)] | @tsv' <<<"$targets")
 
-  for index in "${!pids[@]}"; do
+  for pid_index in "${!pids[@]}"; do
     status=0
-    wait "${pids[$index]}" || status=$?
+    wait "${pids[$pid_index]}" || status=$?
     (( status == 0 )) || failures=$((failures + 1))
   done
 
   jq -sc --argjson failures "$failures" '{results:.,failures:$failures}' "${files[@]}"
-  rm -r -- "$work_dir"
   (( failures == 0 ))
-}
+)
 
 describe_result() {
   jq -r '
     .results[] |
     if .ok then
-      "\(.name): \(if .on == 1 then "on" else "off" end), \(.brightness)%, \((1000000 / .temperature) | round) K"
+      "\(.name): \(if .on == 1 then "on" else "off" end), "
+      + (if (.brightness | type) == "number" then "\(.brightness)%" else "brightness unavailable" end)
+      + ", "
+      + (if (.temperature | type) == "number" and .temperature > 0
+         then "\((1000000 / .temperature) | round) K"
+         else "temperature unavailable"
+         end)
     else
       "\(.name): did not respond"
     end
@@ -357,7 +391,7 @@ describe_result() {
 
 run_discovered_action() {
   local target="$1" action="$2" value="$3" rows targets result status=0
-  local id name address port host
+  local id stable_id name address port host info
 
   validate_action "$action" "$value" || {
     printf 'Invalid action or value.\n' >&2
@@ -369,9 +403,11 @@ run_discovered_action() {
 
   while IFS=$'\t' read -r id name address port host; do
     [[ -n "$id" ]] || continue
-    [[ "$target" == all || "$target" == "$id" ]] || continue
-    if ! read_info "$address" "$port" >/dev/null 2>&1; then continue; fi
-    targets="$(jq -cn --argjson targets "$targets" --arg id "$id" --arg discoveryId "$id" --arg name "$name" \
+    info="$(read_info "$address" "$port" 2>/dev/null)" || continue
+    stable_id="$(jq -r '.serialNumber // empty' <<<"$info")"
+    [[ -n "$stable_id" ]] || stable_id="$id"
+    [[ "$target" == all || "$target" == "$id" || "$target" == "$stable_id" ]] || continue
+    targets="$(jq -cn --argjson targets "$targets" --arg id "$stable_id" --arg discoveryId "$id" --arg name "$name" \
       --arg address "$address" --argjson port "$port" \
       '$targets + [{id:$id,discoveryId:$discoveryId,name:$name,address:$address,port:$port}]')"
   done <<<"$rows"
@@ -403,6 +439,7 @@ setup_flow() {
   previous_connection_uuid=""
   profiles_before=""
   light_connection_uuid=""
+  connect_status=0
   restore_needed=false
   temporary_profile=false
 
@@ -442,7 +479,8 @@ setup_flow() {
   networks="$(
     nmcli -t --escape no -f SSID,SIGNAL device wifi list ifname "$wifi_device" --rescan yes |
       awk -F: '$1 ~ /^Elgato (Key|Ring) Light([[:space:]]|$)/ { print $1 "\t" $2 }' |
-      sort -u
+      sort -u |
+      awk -F '\t' '{ print $1; print $2 }'
   )"
 
   if [[ -z "$networks" ]]; then
@@ -457,19 +495,33 @@ setup_flow() {
         --text='Choose the flashing light to set up' \
         --column='Elgato Wi-Fi' --column='Signal' --print-column=1
   )" || return 0
-  [[ "$selected" =~ ^Elgato\ (Key|Ring)\ Light([[:space:]]|$) ]] || return 1
+  [[ "$selected" =~ ^Elgato\ (Key|Ring)\ Light\ [[:alnum:]_-]+(\ [[:alnum:]_-]+)*$ ]] || return 1
 
   previous_connection_uuid="$(nmcli -g GENERAL.CON-UUID device show "$wifi_device" 2>/dev/null || true)"
   profiles_before="$(nmcli -t -f UUID connection show 2>/dev/null || true)"
-  if ! nmcli --wait 20 device wifi connect "$selected" ifname "$wifi_device" >/dev/null; then
-    zenity --error --title='Set up Key Lights' --text='Could not connect directly to the light.'
-    return 1
-  fi
   restore_needed=true
+  nmcli --wait 20 device wifi connect "$selected" ifname "$wifi_device" >/dev/null || connect_status=$?
+
   light_connection_uuid="$(nmcli -g GENERAL.CON-UUID device show "$wifi_device" 2>/dev/null || true)"
+  if [[ -z "$light_connection_uuid" || "$light_connection_uuid" == '--' ]] ||
+      grep -Fxq "$light_connection_uuid" <<<"$profiles_before"; then
+    while IFS= read -r profile_uuid; do
+      [[ -n "$profile_uuid" ]] || continue
+      grep -Fxq "$profile_uuid" <<<"$profiles_before" && continue
+      profile_ssid="$(nmcli -g 802-11-wireless.ssid connection show uuid "$profile_uuid" 2>/dev/null || true)"
+      [[ "$profile_ssid" == "$selected" ]] || continue
+      light_connection_uuid="$profile_uuid"
+      break
+    done < <(nmcli -t -f UUID connection show 2>/dev/null || true)
+  fi
   if [[ -n "$light_connection_uuid" && "$light_connection_uuid" != '--' ]] &&
       ! grep -Fxq "$light_connection_uuid" <<<"$profiles_before"; then
     temporary_profile=true
+  fi
+
+  if (( connect_status != 0 )); then
+    zenity --error --title='Set up Key Lights' --text='Could not connect directly to the light.'
+    return 1
   fi
 
   if ! read_info 192.168.62.1 9123 >/dev/null 2>&1 || ! read_state 192.168.62.1 9123 >/dev/null 2>&1; then
@@ -490,10 +542,6 @@ setup_flow() {
     'Setup complete. Discovery may take up to 60 seconds.' 2>/dev/null || true
 }
 
-setup() (
-  setup_flow
-)
-
 main() {
   require_runtime || return $?
 
@@ -505,7 +553,7 @@ main() {
       ;;
     setup)
       (( $# == 1 )) || { usage >&2; return 2; }
-      setup
+      setup_flow
       return
       ;;
     control)

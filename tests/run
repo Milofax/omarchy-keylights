@@ -5,8 +5,13 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 work_dir="$(mktemp -d)"
 fake_bin="$work_dir/bin"
 state_file="$work_dir/state.json"
+setup_log="$work_dir/setup-log"
+setup_pid=""
+runtime_pid=""
 
 cleanup() {
+  if [[ -n "$setup_pid" ]]; then kill -TERM -- "-$setup_pid" 2>/dev/null || true; fi
+  if [[ -n "$runtime_pid" ]]; then kill -TERM -- "-$runtime_pid" 2>/dev/null || true; fi
   rm -r -- "$work_dir"
 }
 trap cleanup EXIT
@@ -21,31 +26,210 @@ assert_jq() {
   jq -e "$expression" <<<"$json" >/dev/null || fail "$message"
 }
 
+for required_command in shellcheck node rg qmllint gdbus; do
+  command -v "$required_command" >/dev/null || fail "required development command is missing: $required_command"
+done
+
+payload_dir="$work_dir/plugin-payload"
+mkdir -p "$payload_dir/bin" "$payload_dir/icons"
+for release_file in LICENSE README.md Panel.qml KeyLightsLogic.js manifest.json \
+    bin/keylights bin/keylights-tray icons/io.github.milofax.keylights-symbolic.svg; do
+  [[ -f "$root/$release_file" && ! -L "$root/$release_file" ]] || \
+    fail "release payload file is missing or a symlink: $release_file"
+done
+cp "$root/LICENSE" "$root/README.md" "$root/Panel.qml" "$root/KeyLightsLogic.js" \
+  "$root/manifest.json" "$payload_dir/"
+cp "$root/bin/keylights" "$root/bin/keylights-tray" "$payload_dir/bin/"
+cp "$root/icons/io.github.milofax.keylights-symbolic.svg" "$payload_dir/icons/"
+
 bash -n "$root/bin/keylights"
 shellcheck "$root/bin/keylights"
+shellcheck "$root/tests/run"
+PYTHONPYCACHEPREFIX="$work_dir/pycache" python3 -m py_compile "$root/bin/keylights-tray"
 jq empty "$root/manifest.json"
-omarchy plugin validate "$root"
+omarchy plugin validate "$payload_dir"
+qmllint -I /usr/share/omarchy/shell "$root/Panel.qml" >"$work_dir/qmllint.log" 2>&1 || \
+  fail 'qmllint rejected Panel.qml'
+
+node - "$root/KeyLightsLogic.js" <<'EOF'
+const assert = require("node:assert/strict")
+const Logic = require(process.argv[2])
+
+const on = [{id: "SERIAL-1", discoveryId: "discovery-1", reachable: true, on: 1, brightness: 20, temperature: 220}]
+const off = [{id: "SERIAL-1", discoveryId: "discovery-1", reachable: true, on: 0, brightness: 20, temperature: 220}]
+const unreachable = [{id: "discovery-1", discoveryId: "discovery-1", reachable: false, on: 0}]
+const mixed = [
+  {id: "SERIAL-1", reachable: true, on: 1, brightness: 20, temperature: 200},
+  {id: "SERIAL-2", reachable: true, on: 0, brightness: 80, temperature: 250},
+]
+
+assert.equal(Logic.barVisible(on), true)
+assert.equal(Logic.trayWanted(on), false)
+assert.equal(Logic.barVisible(off), false)
+assert.equal(Logic.trayWanted(off), true)
+assert.equal(Logic.barVisible(unreachable), false)
+assert.equal(Logic.trayWanted(unreachable), true)
+assert.equal(Logic.trayWanted([]), true)
+assert.deepEqual(Logic.advanceTrayMode(false, true, 0), {trayMode: false, confirmations: 1})
+assert.deepEqual(Logic.advanceTrayMode(false, true, 1), {trayMode: true, confirmations: 0})
+assert.deepEqual(Logic.advanceTrayMode(true, false, 0), {trayMode: false, confirmations: 0})
+assert.equal(Logic.trayExitAction(3, false, true), "missing-dependency")
+assert.equal(Logic.trayExitAction(5, false, true), "session-bus")
+assert.equal(Logic.trayExitAction(4, false, true), "retry")
+assert.equal(Logic.trayExitAction(1, false, true), "retry")
+assert.equal(Logic.trayExitAction(1, true, true), "ignore")
+assert.equal(Logic.connectionLost(off), false)
+assert.equal(Logic.connectionLost(unreachable), true)
+assert.equal(Logic.connectionLost(mixed), false)
+assert.equal(Logic.connectionLost([]), false)
+assert.equal(Logic.shouldPoll(false, []), false)
+assert.equal(Logic.shouldPoll(false, off), true)
+assert.equal(Logic.shouldPoll(true, []), true)
+assert.deepEqual(Logic.brightnessSummary(mixed), {value: 50, mixed: true})
+assert.deepEqual(Logic.temperatureSummary(mixed), {value: 4500, mixed: true})
+
+let fifo = Logic.enqueueCommand([], {action: "on"})
+fifo = Logic.enqueueCommand(fifo, {action: "brightness"})
+fifo = Logic.enqueueCommand(fifo, {action: "off"})
+let nextCommand = Logic.dequeueCommand(fifo)
+assert.equal(nextCommand.command.action, "on")
+assert.deepEqual(nextCommand.remaining.map(command => command.action), ["brightness", "off"])
+
+assert.equal(Logic.operationBusy(true, false, false, 0, false), true)
+assert.equal(Logic.operationBusy(false, false, false, 0, true), true)
+assert.equal(Logic.operationReady({}, true, false), false)
+assert.equal(Logic.operationReady({}, false, true), false)
+assert.equal(Logic.operationReady({}, true, true), true)
+
+const reconciled = Logic.reconcileLights(on, unreachable)
+assert.equal(reconciled[0].id, "SERIAL-1")
+assert.equal(reconciled[0].discoveryId, "discovery-1")
+
+const queued = [{targets: [{id: "SERIAL-1", discoveryId: "discovery-1", address: "10.0.0.99", port: 9123}]}]
+const refreshed = Logic.refreshQueuedTargets(queued, [{id: "SERIAL-1", discoveryId: "discovery-1", address: "10.0.0.10", port: 9123, ok: true}])
+assert.equal(refreshed[0].targets[0].address, "10.0.0.10")
+assert.equal(Logic.actionError(2), "The Key Light command was rejected before contacting any device.")
+assert.equal(Logic.actionError(1), "One or more lights did not respond. Please try again.")
+EOF
+
+tray_metadata="$(KEYLIGHTS_TRAY_TEST=metadata "$root/bin/keylights-tray")"
+assert_jq "$tray_metadata" '.busName == "io.github.milofax.KeyLights.Tray"' 'tray helper does not use a stable duplicate-prevention bus name'
+assert_jq "$tray_metadata" '.activate == "open" and .secondaryActivate == "toggleAll" and .contextMenu == "lightsOff"' \
+  'tray helper IPC mapping is incomplete'
+tray_retry="$(KEYLIGHTS_TRAY_TEST=watcher-retry "$root/bin/keylights-tray")"
+assert_jq "$tray_retry" '.attempts == 15 and (.decisions | length) == 15 and .decisions[0] == true and .decisions[14] == false' \
+  'tray watcher registration does not stop after its bounded retry budget'
+
+if python3 -c 'import dbus; dbus.SessionBus()' 2>/dev/null; then
+  # shellcheck disable=SC2016
+  bash -euo pipefail -c '
+  helper="$1"
+  test_dir="$2"
+  first_ready="$test_dir/tray-first-ready"
+  standby_ready="$test_dir/tray-standby-ready"
+  takeover_ready="$test_dir/tray-takeover-ready"
+  object_ready="$test_dir/tray-object-ready"
+  first_pid=""
+  standby_pid=""
+  object_pid=""
+  cleanup_tray_test() {
+    [[ -z "$first_pid" ]] || kill -TERM "$first_pid" 2>/dev/null || true
+    [[ -z "$standby_pid" ]] || kill -TERM "$standby_pid" 2>/dev/null || true
+    [[ -z "$object_pid" ]] || kill -TERM "$object_pid" 2>/dev/null || true
+  }
+  trap cleanup_tray_test EXIT
+
+  KEYLIGHTS_TRAY_TEST=hold KEYLIGHTS_TRAY_READY="$first_ready" "$helper" &
+  first_pid=$!
+  for _ in {1..50}; do [[ -e "$first_ready" ]] && break; sleep 0.02; done
+  [[ -e "$first_ready" ]]
+
+  KEYLIGHTS_TRAY_TEST=hold KEYLIGHTS_TRAY_STANDBY_READY="$standby_ready" \
+    KEYLIGHTS_TRAY_READY="$takeover_ready" "$helper" &
+  standby_pid=$!
+  for _ in {1..50}; do [[ -e "$standby_ready" ]] && break; sleep 0.02; done
+  [[ -e "$standby_ready" ]]
+  [[ ! -e "$takeover_ready" ]]
+  kill -0 "$standby_pid"
+
+  kill -TERM "$first_pid"
+  wait "$first_pid"
+  first_pid=""
+
+  for _ in {1..50}; do [[ -e "$takeover_ready" ]] && break; sleep 0.02; done
+  [[ -e "$takeover_ready" ]]
+  kill -0 "$standby_pid"
+  kill -TERM "$standby_pid"
+  wait "$standby_pid"
+  standby_pid=""
+
+  KEYLIGHTS_TRAY_TEST=object KEYLIGHTS_TRAY_READY="$object_ready" "$helper" &
+  object_pid=$!
+  for _ in {1..50}; do [[ -e "$object_ready" ]] && break; sleep 0.02; done
+  [[ -e "$object_ready" ]]
+  item_id="$(gdbus call --session --dest io.github.milofax.KeyLights.Tray \
+    --object-path /StatusNotifierItem --method org.freedesktop.DBus.Properties.Get \
+    org.kde.StatusNotifierItem Id)"
+  [[ "$item_id" == *io.github.milofax.keylights* ]]
+  icon_name="$(gdbus call --session --dest io.github.milofax.KeyLights.Tray \
+    --object-path /StatusNotifierItem --method org.freedesktop.DBus.Properties.Get \
+    org.kde.StatusNotifierItem IconName)"
+  [[ "$icon_name" == *io.github.milofax.keylights-symbolic* ]]
+  kill -TERM "$object_pid"
+  wait "$object_pid"
+  object_pid=""
+' _ "$root/bin/keylights-tray" "$work_dir"
+elif [[ "${KEYLIGHTS_TEST_REQUIRE_DBUS:-0}" == 1 ]]; then
+  fail 'session D-Bus is unavailable for the tray lifecycle test'
+fi
 
 [[ -x "$root/bin/keylights" ]] || fail 'bin/keylights is not executable'
-[[ -z "$(find "$root" -name .git -prune -o -type l -print -quit)" ]] || fail 'plugin contains a symlink'
+[[ -x "$root/bin/keylights-tray" ]] || fail 'bin/keylights-tray is not executable'
+[[ -f "$root/icons/io.github.milofax.keylights-symbolic.svg" ]] || fail 'tray icon asset is missing'
+[[ -z "$(find "$payload_dir" -type l -print -quit)" ]] || fail 'release payload contains a symlink'
 
 grep -q '"id": "io.github.milofax.keylights"' "$root/manifest.json"
+grep -q '"version": "1.1.0"' "$root/manifest.json"
 grep -q 'moduleName: "io.github.milofax.keylights"' "$root/Panel.qml"
 grep -q 'ipcTarget: "io.github.milofax.keylights"' "$root/Panel.qml"
+grep -Fq 'import "KeyLightsLogic.js" as Logic' "$root/Panel.qml"
+grep -Fq 'visible: !trayMode || trayUnavailable' "$root/Panel.qml"
+grep -Fq 'readonly property bool trayWanted: Logic.trayWanted(lights)' "$root/Panel.qml"
+grep -Fq 'Logic.advanceTrayMode(trayMode, trayWanted, trayWantedConfirmations)' "$root/Panel.qml"
+grep -Fq 'Logic.trayExitAction(exitCode, trayStopRequested, trayMode)' "$root/Panel.qml"
+grep -Fq 'trayRetryCount >= trayRetryLimit' "$root/Panel.qml"
+grep -Fq 'text: root.trayErrorText' "$root/Panel.qml"
+grep -Fq 'running: Logic.shouldPoll(root.opened, root.lights)' "$root/Panel.qml"
+grep -Fq 'property bool statusInFlight: false' "$root/Panel.qml"
+grep -Fq 'Logic.operationReady(statusInFlight, statusExitReceived, statusOutputReceived)' "$root/Panel.qml"
+grep -Fq 'onStreamFinished: root.handleStatusError(text)' "$root/Panel.qml"
+grep -Fq 'command: [root.trayTool]' "$root/Panel.qml"
+grep -Fq 'textFormat: Text.PlainText' "$root/Panel.qml"
+grep -Fq 'pragma ComponentBehavior: Bound' "$root/Panel.qml"
 grep -q 'property var commandQueue: \[\]' "$root/Panel.qml"
-grep -q '!actionExitReceived || !actionOutputReceived' "$root/Panel.qml"
+grep -Fq 'Logic.operationReady(activeCommand, actionExitReceived, actionOutputReceived)' "$root/Panel.qml"
 grep -q 'onStreamFinished: root.handleActionOutput(text)' "$root/Panel.qml"
 grep -q 'onExited: function(exitCode) { root.handleActionExit(exitCode) }' "$root/Panel.qml"
+grep -Fq 'onStreamFinished: root.handleActionError(text)' "$root/Panel.qml"
 grep -q 'Math.round(value / 100) \* 100' "$root/Panel.qml"
-grep -q 'lights.length > 0 || setupAvailable || errorText !== ""' "$root/Panel.qml"
 grep -q 'root.brightnessMixed ? "Mixed"' "$root/Panel.qml"
 grep -q 'root.temperatureMixed ? "Mixed"' "$root/Panel.qml"
 grep -q 'omarchy plugin remove io.github.milofax.keylights' "$root/README.md"
+grep -Fq 'system-tray drawer' "$root/README.md"
+grep -Eq 'python-dbus.*python-gobject' "$root/README.md"
+grep -Fq './bin/keylights control ACTION VALUE TARGETS_JSON' "$root/README.md"
+grep -Fq 'same-user IPC' "$root/README.md"
+grep -Eq 'shellcheck.*node.*ripgrep.*qmllint.*gdbus.*Omarchy installation' "$root/README.md"
+grep -Fq 'bar layout so this fallback remains reachable' "$root/README.md"
 grep -q 'connection delete uuid' "$root/bin/keylights"
-grep -q 'serial" == "\$expected_id' "$root/bin/keylights"
+grep -Fq "serial\" == \"\$expected_id" "$root/bin/keylights"
 
-if rg -n --glob '!tests/run' '192\.168\.1\.|Celtadon|elgato-key-light-[0-9a-f]+\.local' "$root"; then
+if rg -n --glob '!tests/run' '192\.168\.1\.|elgato-key-light-[0-9a-f]+\.local' "$root"; then
   fail 'private network details found in repository'
+fi
+if [[ -n "${KEYLIGHTS_TEST_PRIVATE_PATTERN:-}" ]] &&
+    rg -n --glob '!tests/run' -- "$KEYLIGHTS_TEST_PRIVATE_PATTERN" "$root"; then
+  fail 'locally configured private details found in repository'
 fi
 
 mkdir -p -- "$fake_bin"
@@ -53,7 +237,16 @@ mkdir -p -- "$fake_bin"
 cat >"$fake_bin/avahi-browse" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${KEYLIGHT_TEST_AVAHI:-ok}" == fail ]]; then exit 1; fi
-printf '=;eth0;IPv4;Elgato\\032Key\\032Light\\032TEST;_elg._tcp;local;test.local;10.0.0.10;9123;"id=discovery-1"\n'
+if [[ "${KEYLIGHT_TEST_ESCAPED_NAME:-0}" == 1 ]]; then
+  printf '=;eth0;IPv4;Elgato\\032Key\\032Light\\032T\\065ST;_elg._tcp;local;test.local;10.0.0.10;9123;"id=discovery-1"\n'
+elif [[ "${KEYLIGHT_TEST_MANY:-0}" == 1 ]]; then
+  for number in {10..21}; do
+    printf '=;eth0;IPv4;Elgato\\032Key\\032Light\\032%s;_elg._tcp;local;test%s.local;10.0.0.%s;9123;"id=discovery-%s"\n' \
+      "$number" "$number" "$number" "$number"
+  done
+else
+  printf '=;eth0;IPv4;Elgato\\032Key\\032Light\\032TEST;_elg._tcp;local;test.local;10.0.0.10;9123;"id=discovery-1"\n'
+fi
 EOF
 
 cat >"$fake_bin/curl" <<'EOF'
@@ -71,10 +264,38 @@ while (( $# > 0 )); do
   esac
 done
 
-[[ "$url" == http://10.0.0.10:9123/* || "$url" == http://192.168.62.1:9123/* ]] || exit 28
+[[ "$url" =~ ^http://10\.0\.0\.(1[0-9]|2[01]):9123/ || "$url" == http://192.168.62.1:9123/* ]] || exit 28
+if [[ -n "${KEYLIGHT_TEST_CURL_DELAY:-}" ]]; then sleep "$KEYLIGHT_TEST_CURL_DELAY"; fi
+if [[ -n "${KEYLIGHT_TEST_CONCURRENCY_DIR:-}" ]]; then
+  exec 9>>"$KEYLIGHT_TEST_CONCURRENCY_DIR/lock"
+  flock 9
+  active="$(<"$KEYLIGHT_TEST_CONCURRENCY_DIR/active")"
+  peak="$(<"$KEYLIGHT_TEST_CONCURRENCY_DIR/peak")"
+  active=$((active + 1))
+  printf '%s\n' "$active" >"$KEYLIGHT_TEST_CONCURRENCY_DIR/active"
+  (( active <= peak )) || printf '%s\n' "$active" >"$KEYLIGHT_TEST_CONCURRENCY_DIR/peak"
+  flock -u 9
+  sleep 0.05
+  flock 9
+  active="$(<"$KEYLIGHT_TEST_CONCURRENCY_DIR/active")"
+  printf '%s\n' "$((active - 1))" >"$KEYLIGHT_TEST_CONCURRENCY_DIR/active"
+  flock -u 9
+fi
+if [[ "$url" == http://192.168.62.1:9123/* ]]; then
+  printf 'accessory-check\n' >>"$KEYLIGHT_TEST_SETUP_LOG"
+  [[ "${KEYLIGHT_TEST_ACCESSORY:-ok}" != fail ]] || exit 22
+fi
 case "$url" in
   */elgato/accessory-info)
-    printf '%s\n' '{"productName":"Elgato Key Light","serialNumber":"SERIAL-1","features":["lights"]}'
+    if [[ "${KEYLIGHT_TEST_SERIAL_MISMATCH:-0}" == 1 ]]; then
+      serial='OTHER-SERIAL'
+    elif [[ "${KEYLIGHT_TEST_MANY:-0}" == 1 ]]; then
+      serial="${url#http://10.0.0.}"
+      serial="SERIAL-${serial%%:*}"
+    else
+      serial='SERIAL-1'
+    fi
+    printf '{"productName":"Elgato Key Light","serialNumber":"%s","features":["lights"]}\n' "$serial"
     ;;
   */elgato/lights)
     if [[ "$method" == PUT ]]; then
@@ -82,7 +303,11 @@ case "$url" in
         '$current * $payload.lights[0]')"
       printf '%s\n' "$next" >"$KEYLIGHT_TEST_STATE"
     fi
-    jq -cn --argjson state "$(<"$KEYLIGHT_TEST_STATE")" '{numberOfLights:1,lights:[$state]}'
+    if [[ "${KEYLIGHT_TEST_OMIT_TEMPERATURE:-0}" == 1 ]]; then
+      jq -cn --argjson state "$(<"$KEYLIGHT_TEST_STATE")" '{numberOfLights:1,lights:[($state | del(.temperature))]}'
+    else
+      jq -cn --argjson state "$(<"$KEYLIGHT_TEST_STATE")" '{numberOfLights:1,lights:[$state]}'
+    fi
     ;;
   *) exit 22 ;;
 esac
@@ -90,18 +315,48 @@ EOF
 
 cat >"$fake_bin/nmcli" <<'EOF'
 #!/usr/bin/env bash
-if [[ "${KEYLIGHT_TEST_SETUP:-0}" != 1 ]]; then exit 0; fi
+if [[ "${KEYLIGHT_TEST_SETUP:-0}" != 1 ]]; then
+  [[ "$*" == '-t --escape no -f SSID device wifi list --rescan no' ]]
+  exit
+fi
 case "$*" in
   '-t -f DEVICE,TYPE device status') printf 'wlan0:wifi\n' ;;
   'device wifi rescan ifname wlan0') ;;
   '-t --escape no -f SSID,SIGNAL device wifi list ifname wlan0 --rescan yes')
     printf 'Elgato Key Light TEST:90\n'
+    if [[ "${KEYLIGHT_TEST_TWO_NETWORKS:-0}" == 1 ]]; then
+      printf 'Elgato Ring Light SECOND:75\n'
+    fi
     ;;
   '-g GENERAL.CON-UUID device show wlan0')
-    if [[ "$(<"$KEYLIGHT_TEST_NM_STATE")" == light ]]; then printf 'TEMP-UUID\n'; else printf 'PREV-UUID\n'; fi
+    case "$(<"$KEYLIGHT_TEST_NM_STATE")" in
+      light) printf 'TEMP-UUID\n' ;;
+      created) printf '%s\n' '--' ;;
+      *) printf 'PREV-UUID\n' ;;
+    esac
     ;;
-  '-t -f UUID connection show') printf 'PREV-UUID\n' ;;
+  '-t -f UUID connection show')
+    printf 'PREV-UUID\n'
+    [[ "$(<"$KEYLIGHT_TEST_NM_STATE")" == previous ]] || printf 'TEMP-UUID\n'
+    ;;
+  '-t --escape no -f UUID,NAME connection show')
+    printf 'PREV-UUID:Home\n'
+    if [[ "$(<"$KEYLIGHT_TEST_NM_STATE")" != previous ]]; then
+      if [[ "${KEYLIGHT_TEST_PROFILE_RENAMED:-0}" == 1 ]]; then
+        printf 'TEMP-UUID:Elgato Key Light TEST 1\n'
+      else
+        printf 'TEMP-UUID:Elgato Key Light TEST\n'
+      fi
+    fi
+    ;;
+  '-g 802-11-wireless.ssid connection show uuid TEMP-UUID')
+    printf 'Elgato Key Light TEST\n'
+    ;;
   '--wait 20 device wifi connect Elgato Key Light TEST ifname wlan0')
+    if [[ "${KEYLIGHT_TEST_CONNECT:-ok}" == fail ]]; then
+      printf 'created\n' >"$KEYLIGHT_TEST_NM_STATE"
+      exit 10
+    fi
     printf 'light\n' >"$KEYLIGHT_TEST_NM_STATE"
     ;;
   '--wait 20 connection up uuid PREV-UUID ifname wlan0')
@@ -118,14 +373,35 @@ EOF
 
 cat >"$fake_bin/zenity" <<'EOF'
 #!/usr/bin/env bash
+set -euo pipefail
+list=false
 for argument in "$@"; do
-  if [[ "$argument" == --list ]]; then printf 'Elgato Key Light TEST\n'; fi
+  if [[ "$argument" == --list ]]; then list=true; fi
+  if [[ "$argument" == --question ]]; then
+    printf 'http-confirmation\n' >>"$KEYLIGHT_TEST_SETUP_LOG"
+    [[ "${KEYLIGHT_TEST_CONFIRM:-allow}" != deny ]] || exit 1
+  fi
+  if [[ "$argument" == --text=Enter\ the\ destination* && "${KEYLIGHT_TEST_ZENITY_WAIT:-0}" == 1 ]]; then
+    : >"$KEYLIGHT_TEST_SIGNAL_READY"
+    trap 'exit 143' TERM
+    while true; do sleep 0.1; done
+  fi
 done
+if [[ "$list" == true ]]; then
+  mapfile -t cells
+  if [[ "${KEYLIGHT_TEST_ZENITY_VALIDATE:-0}" == 1 ]]; then
+    [[ "${#cells[@]}" == 4 ]]
+    [[ "${cells[0]}" == 'Elgato Key Light TEST' && "${cells[1]}" == 90 ]]
+    [[ "${cells[2]}" == 'Elgato Ring Light SECOND' && "${cells[3]}" == 75 ]]
+  fi
+  printf '%s\n' "${KEYLIGHT_TEST_ZENITY_SELECTION:-${cells[0]}}"
+fi
 exit 0
 EOF
 
 cat >"$fake_bin/xdg-open" <<'EOF'
 #!/usr/bin/env bash
+printf 'browser-open\n' >>"$KEYLIGHT_TEST_SETUP_LOG"
 exit 0
 EOF
 
@@ -147,6 +423,45 @@ assert_jq "$status_json" '.lights[0].id == "SERIAL-1"' 'stable accessory id was 
 assert_jq "$status_json" '.lights[0].discoveryId == "discovery-1"' 'mDNS id was not retained for recovery'
 assert_jq "$status_json" '.lights[0].reachable == true' 'fixture light was not reachable'
 
+escaped_name_json="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_ESCAPED_NAME=1 \
+  "$root/bin/keylights" json)"
+assert_jq "$escaped_name_json" '.lights[0].name == "Elgato Key Light TAST"' \
+  'generic decimal Avahi escapes were not decoded'
+
+concurrency_dir="$work_dir/concurrency"
+mkdir -p "$concurrency_dir"
+printf '0\n' >"$concurrency_dir/active"
+printf '0\n' >"$concurrency_dir/peak"
+many_status_json="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_MANY=1 \
+  KEYLIGHT_TEST_CONCURRENCY_DIR="$concurrency_dir" "$root/bin/keylights" json)"
+(( $(<"$concurrency_dir/peak") <= 8 )) || fail 'device probing exceeded the eight-process concurrency limit'
+assert_jq "$many_status_json" '.lights | length == 12' 'parallel discovery dropped or duplicated a light result'
+assert_jq "$many_status_json" '[.lights[].id] | unique | length == 12' 'parallel discovery returned duplicate light ids'
+
+runtime_tmp="$work_dir/runtime-tmp"
+mkdir -p "$runtime_tmp"
+setsid env PATH="$test_path" TMPDIR="$runtime_tmp" KEYLIGHT_TEST_STATE="$state_file" \
+  KEYLIGHT_TEST_MANY=1 KEYLIGHT_TEST_CURL_DELAY=5 "$root/bin/keylights" json \
+  >"$work_dir/interrupted-json-output" 2>&1 &
+runtime_pid=$!
+for _ in {1..100}; do
+  [[ -n "$(find "$runtime_tmp" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]] && break
+  sleep 0.02
+done
+[[ -n "$(find "$runtime_tmp" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]] || \
+  fail 'interrupted runtime fixture did not create its temporary directory'
+kill -TERM -- "-$runtime_pid"
+set +e
+wait "$runtime_pid"
+set -e
+runtime_pid=""
+for _ in {1..100}; do
+  [[ -z "$(find "$runtime_tmp" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]] && break
+  sleep 0.02
+done
+[[ -z "$(find "$runtime_tmp" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]] || \
+  fail 'interrupted status call leaked its temporary directory'
+
 set +e
 discovery_error="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_AVAHI=fail \
   "$root/bin/keylights" json 2>/dev/null)"
@@ -160,10 +475,24 @@ direct_result="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TE
   "$root/bin/keylights" control status - "$targets")"
 assert_jq "$direct_result" '.failures == 0 and .results[0].ok == true' 'direct control unnecessarily depended on mDNS'
 
+missing_temperature="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_OMIT_TEMPERATURE=1 \
+  "$root/bin/keylights" all status)"
+grep -Fq 'temperature unavailable' <<<"$missing_temperature" || \
+  fail 'human-readable status did not tolerate a missing temperature value'
+
+serial_status="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" "$root/bin/keylights" SERIAL-1 status)"
+grep -Fq 'Elgato Key Light TEST:' <<<"$serial_status" || \
+  fail 'the stable DEVICE_ID returned by json was not accepted by the direct CLI'
+
 brightness_result="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" \
   "$root/bin/keylights" control brightness 55 "$targets")"
 assert_jq "$brightness_result" '.results[0].brightness == 55' 'brightness response was not synchronized'
 jq -e '.brightness == 55' "$state_file" >/dev/null || fail 'brightness was not applied by the fixture API'
+
+temperature_result="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" \
+  "$root/bin/keylights" control temperature 2900 "$targets")"
+assert_jq "$temperature_result" '.results[0].temperature == 344' 'minimum Kelvin value was not clamped to the supported mired range'
+jq -e '.temperature == 344' "$state_file" >/dev/null || fail 'clamped temperature was not applied by the fixture API'
 
 set +e
 PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" \
@@ -178,14 +507,118 @@ recovered_result="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" \
   "$root/bin/keylights" control status - "$stale_targets")"
 assert_jq "$recovered_result" '.failures == 0 and .results[0].address == "10.0.0.10"' 'stale address was not recovered through mDNS'
 
+set +e
+mismatch_result="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_SERIAL_MISMATCH=1 \
+  "$root/bin/keylights" control status - "$stale_targets")"
+mismatch_status=$?
+set -e
+[[ "$mismatch_status" == 1 ]] || fail 'mismatched rediscovered serial was accepted'
+assert_jq "$mismatch_result" '.failures == 1 and .results[0].ok == false' \
+  'mismatched rediscovered serial did not produce a device failure'
+
+partial_targets='[{"id":"SERIAL-1","discoveryId":"discovery-1","name":"First","address":"10.0.0.10","port":9123},{"id":"SERIAL-2","discoveryId":"missing","name":"Second","address":"10.0.0.98","port":9123}]'
+set +e
+partial_result="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" \
+  "$root/bin/keylights" control status - "$partial_targets")"
+partial_status=$?
+set -e
+[[ "$partial_status" == 1 ]] || fail 'partial device failure returned the wrong status'
+assert_jq "$partial_result" '.failures == 1 and ([.results[].ok] | sort) == [false,true]' \
+  'partial device failure did not preserve the successful result'
+
+many_targets="$(jq -cn '[range(10;22) | {id:("SERIAL-" + tostring),discoveryId:("discovery-" + tostring),name:("Light " + tostring),address:("10.0.0." + tostring),port:9123}]')"
+printf '0\n' >"$concurrency_dir/active"
+printf '0\n' >"$concurrency_dir/peak"
+many_control_json="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_CONCURRENCY_DIR="$concurrency_dir" \
+  "$root/bin/keylights" control status - "$many_targets")"
+(( $(<"$concurrency_dir/peak") <= 8 )) || fail 'group control exceeded the eight-process concurrency limit'
+assert_jq "$many_control_json" '.results | length == 12' 'parallel group control dropped or duplicated a result'
+assert_jq "$many_control_json" '[.results[].id] | unique | length == 12' 'parallel group control returned duplicate ids'
+
 nm_state="$work_dir/nm-state"
 nm_log="$work_dir/nm-log"
 printf 'previous\n' >"$nm_state"
 : >"$nm_log"
+: >"$setup_log"
 PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_SETUP=1 \
-  KEYLIGHT_TEST_NM_STATE="$nm_state" KEYLIGHT_TEST_NM_LOG="$nm_log" \
+  KEYLIGHT_TEST_TWO_NETWORKS=1 KEYLIGHT_TEST_ZENITY_VALIDATE=1 \
+  KEYLIGHT_TEST_NM_STATE="$nm_state" KEYLIGHT_TEST_NM_LOG="$nm_log" KEYLIGHT_TEST_SETUP_LOG="$setup_log" \
   "$root/bin/keylights" setup
 grep -Fxq restore "$nm_log" || fail 'setup did not restore the previous network connection'
 grep -Fxq delete "$nm_log" || fail 'setup did not delete its temporary NetworkManager profile'
+
+printf 'previous\n' >"$nm_state"
+: >"$nm_log"
+: >"$setup_log"
+set +e
+PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_SETUP=1 \
+  KEYLIGHT_TEST_ZENITY_SELECTION=$'Elgato Key Light TEST\t90' \
+  KEYLIGHT_TEST_NM_STATE="$nm_state" KEYLIGHT_TEST_NM_LOG="$nm_log" KEYLIGHT_TEST_SETUP_LOG="$setup_log" \
+  "$root/bin/keylights" setup >/dev/null 2>&1
+malformed_selection_status=$?
+set -e
+[[ "$malformed_selection_status" == 1 ]] || fail 'malformed Zenity selection was accepted'
+[[ ! -s "$nm_log" ]] || fail 'malformed Zenity selection changed NetworkManager state'
+
+printf 'previous\n' >"$nm_state"
+: >"$nm_log"
+: >"$setup_log"
+set +e
+PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_SETUP=1 KEYLIGHT_TEST_CONNECT=fail \
+  KEYLIGHT_TEST_PROFILE_RENAMED=1 \
+  KEYLIGHT_TEST_NM_STATE="$nm_state" KEYLIGHT_TEST_NM_LOG="$nm_log" KEYLIGHT_TEST_SETUP_LOG="$setup_log" \
+  "$root/bin/keylights" setup >/dev/null 2>&1
+connect_failure_status=$?
+set -e
+[[ "$connect_failure_status" == 1 ]] || fail 'failed accessory Wi-Fi connection returned the wrong status'
+grep -Fxq restore "$nm_log" || fail 'connect failure did not restore the previous network connection'
+grep -Fxq delete "$nm_log" || fail 'connect failure did not delete its newly created profile'
+
+printf 'previous\n' >"$nm_state"
+: >"$nm_log"
+: >"$setup_log"
+set +e
+PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_SETUP=1 KEYLIGHT_TEST_ACCESSORY=fail \
+  KEYLIGHT_TEST_NM_STATE="$nm_state" KEYLIGHT_TEST_NM_LOG="$nm_log" KEYLIGHT_TEST_SETUP_LOG="$setup_log" \
+  "$root/bin/keylights" setup >/dev/null 2>&1
+accessory_failure_status=$?
+set -e
+[[ "$accessory_failure_status" == 1 ]] || fail 'invalid accessory API did not abort setup'
+grep -Fxq accessory-check "$setup_log" || fail 'setup did not check the local accessory API'
+if grep -Fxq browser-open "$setup_log"; then fail 'setup opened the browser after accessory verification failed'; fi
+grep -Fxq restore "$nm_log" || fail 'accessory verification failure did not restore the previous connection'
+grep -Fxq delete "$nm_log" || fail 'accessory verification failure did not delete the temporary profile'
+
+printf 'previous\n' >"$nm_state"
+: >"$nm_log"
+: >"$setup_log"
+PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_SETUP=1 KEYLIGHT_TEST_CONFIRM=deny \
+  KEYLIGHT_TEST_NM_STATE="$nm_state" KEYLIGHT_TEST_NM_LOG="$nm_log" KEYLIGHT_TEST_SETUP_LOG="$setup_log" \
+  "$root/bin/keylights" setup
+grep -Fxq http-confirmation "$setup_log" || fail 'setup did not request explicit HTTP-risk confirmation'
+if grep -Fxq browser-open "$setup_log"; then fail 'setup opened the browser after HTTP-risk confirmation was denied'; fi
+grep -Fxq restore "$nm_log" || fail 'confirmation cancellation did not restore the previous connection'
+grep -Fxq delete "$nm_log" || fail 'confirmation cancellation did not delete the temporary profile'
+
+printf 'previous\n' >"$nm_state"
+: >"$nm_log"
+: >"$setup_log"
+signal_ready="$work_dir/signal-ready"
+setsid env PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_SETUP=1 \
+  KEYLIGHT_TEST_ZENITY_WAIT=1 KEYLIGHT_TEST_SIGNAL_READY="$signal_ready" \
+  KEYLIGHT_TEST_NM_STATE="$nm_state" KEYLIGHT_TEST_NM_LOG="$nm_log" KEYLIGHT_TEST_SETUP_LOG="$setup_log" \
+  "$root/bin/keylights" setup >"$work_dir/signal-output" 2>&1 &
+setup_pid=$!
+for _ in {1..100}; do [[ -e "$signal_ready" ]] && break; sleep 0.02; done
+[[ -e "$signal_ready" ]] || fail 'signal-ordering fixture did not reach the setup confirmation stage'
+kill -TERM -- "-$setup_pid"
+set +e
+wait "$setup_pid"
+signal_status=$?
+set -e
+setup_pid=""
+[[ "$signal_status" == 130 ]] || fail 'setup signal did not return status 130'
+grep -Fxq restore "$nm_log" || fail 'setup signal did not restore the previous connection'
+grep -Fxq delete "$nm_log" || fail 'setup signal did not delete the temporary profile'
 
 printf 'All plugin checks passed.\n'

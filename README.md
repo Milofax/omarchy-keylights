@@ -8,7 +8,7 @@ An Omarchy bar plugin that automatically discovers and controls Elgato Key Light
 - Individual on/off switches for every discovered light
 - Shared brightness and color-temperature controls with explicit mixed-value states
 - Fast retries for occasionally unresponsive light APIs
-- A bar icon that shows on, off, partial, and setup states
+- A standalone bar icon while a light is on, with an automatic system-tray fallback otherwise
 - Setup flow for factory-reset lights through Elgato's local pairing page
 - No Elgato Control Center installation required
 
@@ -16,6 +16,8 @@ An Omarchy bar plugin that automatically discovers and controls Elgato Key Light
 
 - Omarchy with Quickshell plugin support
 - `avahi`, `curl`, and `jq` for discovery and control
+- Python 3 with `python-dbus` and `python-gobject` for the system-tray item
+- The `omarchy.tray` widget present in the bar layout for the automatic tray fallback
 - NetworkManager, Zenity, a Wi-Fi adapter, and a browser for first-time setup
 - Key Lights and the Omarchy computer on the same local network
 
@@ -46,7 +48,7 @@ The plugin does not create configuration files, services, caches, or credential 
 - `R` in the panel: refresh discovery and state
 - `S` in the panel: start setup
 
-The icon is filled while at least one light is on. It is crossed while all lights are off, carries an `×` when setup or attention is required, and disappears when no configured or reset Key Light is discoverable.
+While at least one reachable light is on, the normal filled Key Lights icon occupies its standalone bar slot. When all discovered lights are off or no light is reachable, that slot collapses and Key Lights remains available in Omarchy's system-tray drawer behind the chevron. Keep `omarchy.tray` in the bar layout so this fallback remains reachable. If the tray's Python dependencies are missing, the plugin retains its bar button and marks it with an `×` instead of disappearing. The same `×` also calls attention to setup availability, discovery errors, or unreachable lights. The tray item uses the same controls: left-click opens the panel, middle-click toggles all reachable lights, right-click turns them off, and scrolling adjusts shared brightness.
 
 The brightness and color-temperature sliders control all reachable lights. If their current values differ, the panel displays **Mixed** until a shared value is selected. Color temperature is the light's configured setpoint, not a measured room temperature.
 
@@ -67,11 +69,16 @@ The plugin includes its local driver at `bin/keylights`:
 ./bin/keylights DEVICE_ID brightness 40
 ./bin/keylights DEVICE_ID temperature 4700
 ./bin/keylights setup
+./bin/keylights control ACTION VALUE TARGETS_JSON
 ```
+
+`control` is the panel's snapshot-based internal interface. `VALUE` is `-` for actions without a value, and `TARGETS_JSON` is the validated endpoint array returned from panel state. Invalid actions, values, or targets exit with status 2 before device I/O; missing dependencies or discovery failures use status 3.
 
 ## Privacy and security
 
-The plugin communicates only with Avahi, NetworkManager, and discovered Elgato lights on the local network. Discovery verifies the Elgato accessory API before exposing an endpoint to the panel; a changed address is verified again before retrying a command. The plugin does not contact a cloud service or store Wi-Fi credentials.
+The plugin communicates only with Avahi, NetworkManager, and discovered Elgato lights on the local network. Discovery marks an endpoint reachable only after verifying the Elgato accessory API; unreachable advertisements may still appear as disabled panel rows. A changed address is verified again, including its stable serial when available, before retrying a command. The plugin does not contact a cloud service or store Wi-Fi credentials.
+
+The tray helper owns one fixed name on the local session D-Bus, so multiple monitor instances cannot publish duplicate icons. Other monitor instances wait without respawning and take ownership if the active monitor disappears. The helper is started only while the standalone bar icon is hidden, unregisters on termination, and talks back to the existing panel through Omarchy's same-user IPC. Like every Omarchy IPC target, its setup and control methods are available to other processes running as the same user; this does not cross the operating system's user boundary. Background discovery polling runs only while the panel is open or at least one previously discovered light remains known.
 
 Omarchy plugins run unsandboxed as the current user. Review plugin code before installation, as you would for any third-party Omarchy plugin.
 
@@ -83,6 +90,8 @@ Validate the repository with:
 omarchy plugin validate .
 ./tests/run
 ```
+
+Development checks require `shellcheck`, `node`, `ripgrep`, `qmllint`, `gdbus` (from GLib), and an Omarchy installation with its plugin validator. The suite replaces Avahi, curl, NetworkManager, Zenity, browser, and notification commands with temporary fixtures; it never contacts a real light or changes the host network. Set `KEYLIGHTS_TEST_REQUIRE_DBUS=1` to require the tray ownership/SIGTERM lifecycle test when a writable session D-Bus is available.
 
 ## License
 

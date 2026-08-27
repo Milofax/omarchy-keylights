@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.milofax.keylights",
   "name": "Key Lights",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Milofax",
   "license": "MIT",
-  "description": "Discover, control, and set up Elgato Key Lights from the Omarchy bar.",
+  "description": "Discover, control, and set up Elgato Key Lights from the Omarchy bar and tray drawer.",
   "kinds": [
     "bar-widget"
   ],

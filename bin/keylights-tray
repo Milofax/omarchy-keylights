@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Publish Key Lights as one StatusNotifierItem while its bar slot is hidden."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+
+try:
+    import dbus
+    import dbus.service
+    from dbus.mainloop.glib import DBusGMainLoop
+    from gi.repository import GLib
+except ImportError as error:
+    print(f"Key Lights tray dependency is missing: {error.name}", file=sys.stderr)
+    raise SystemExit(3) from error
+
+
+BUS_NAME = "io.github.milofax.KeyLights.Tray"
+ITEM_ID = "io.github.milofax.keylights"
+ITEM_PATH = "/StatusNotifierItem"
+ITEM_INTERFACE = "org.kde.StatusNotifierItem"
+PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
+WATCHER_NAME = "org.kde.StatusNotifierWatcher"
+WATCHER_PATH = "/StatusNotifierWatcher"
+WATCHER_INTERFACE = "org.kde.StatusNotifierWatcher"
+WATCHER_MAX_ATTEMPTS = 15
+IPC_TARGET = "io.github.milofax.keylights"
+ICON_DIR = Path(__file__).resolve().parent.parent / "icons"
+
+IPC_METHODS = {
+    "activate": "open",
+    "secondaryActivate": "toggleAll",
+    "contextMenu": "lightsOff",
+}
+
+
+def metadata() -> dict[str, str]:
+    return {
+        "busName": BUS_NAME,
+        "id": ITEM_ID,
+        **IPC_METHODS,
+    }
+
+
+def call_shell(method: str) -> None:
+    try:
+        subprocess.run(
+            ["omarchy-shell", "-q", IPC_TARGET, method],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+
+
+class StatusNotifierItem(dbus.service.Object):
+    def __init__(self, bus: dbus.SessionBus) -> None:
+        super().__init__(bus, ITEM_PATH)
+        self._properties = {
+            "Category": dbus.String("Hardware"),
+            "Id": dbus.String(ITEM_ID),
+            "Title": dbus.String("Key Lights"),
+            "Status": dbus.String("Active"),
+            "WindowId": dbus.UInt32(0),
+            "IconName": dbus.String("io.github.milofax.keylights-symbolic"),
+            "IconThemePath": dbus.String(str(ICON_DIR)),
+            "IconPixmap": dbus.Array([], signature="(iiay)"),
+            "OverlayIconName": dbus.String(""),
+            "OverlayIconPixmap": dbus.Array([], signature="(iiay)"),
+            "AttentionIconName": dbus.String(""),
+            "AttentionIconPixmap": dbus.Array([], signature="(iiay)"),
+            "AttentionMovieName": dbus.String(""),
+            "ToolTip": dbus.Struct(
+                (
+                    dbus.String(""),
+                    dbus.Array([], signature="(iiay)"),
+                    dbus.String("Key Lights"),
+                    dbus.String("Open controls"),
+                ),
+                signature=None,
+            ),
+            "ItemIsMenu": dbus.Boolean(False),
+            "Menu": dbus.ObjectPath("/"),
+        }
+
+    @dbus.service.method(PROPERTIES_INTERFACE, in_signature="ss", out_signature="v")
+    def Get(self, interface_name: str, property_name: str) -> object:
+        if interface_name != ITEM_INTERFACE or property_name not in self._properties:
+            raise dbus.exceptions.DBusException(
+                "Unknown property", name="org.freedesktop.DBus.Error.UnknownProperty"
+            )
+        return self._properties[property_name]
+
+    @dbus.service.method(PROPERTIES_INTERFACE, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface_name: str) -> dict[str, object]:
+        if interface_name != ITEM_INTERFACE:
+            return dbus.Dictionary({}, signature="sv")
+        return dbus.Dictionary(self._properties, signature="sv")
+
+    @dbus.service.method(PROPERTIES_INTERFACE, in_signature="ssv", out_signature="")
+    def Set(self, interface_name: str, property_name: str, value: object) -> None:
+        raise dbus.exceptions.DBusException(
+            "Properties are read-only", name="org.freedesktop.DBus.Error.PropertyReadOnly"
+        )
+
+    @dbus.service.method(ITEM_INTERFACE, in_signature="ii", out_signature="")
+    def Activate(self, x: int, y: int) -> None:
+        call_shell(IPC_METHODS["activate"])
+
+    @dbus.service.method(ITEM_INTERFACE, in_signature="ii", out_signature="")
+    def SecondaryActivate(self, x: int, y: int) -> None:
+        call_shell(IPC_METHODS["secondaryActivate"])
+
+    @dbus.service.method(ITEM_INTERFACE, in_signature="ii", out_signature="")
+    def ContextMenu(self, x: int, y: int) -> None:
+        call_shell(IPC_METHODS["contextMenu"])
+
+    @dbus.service.method(ITEM_INTERFACE, in_signature="is", out_signature="")
+    def Scroll(self, delta: int, orientation: str) -> None:
+        if orientation.lower() == "vertical":
+            call_shell("brightnessUp" if delta > 0 else "brightnessDown")
+
+
+def claim_name(bus: dbus.SessionBus) -> bool:
+    reply = bus.request_name(BUS_NAME, dbus.bus.NAME_FLAG_DO_NOT_QUEUE)
+    return reply in (
+        dbus.bus.REQUEST_NAME_REPLY_PRIMARY_OWNER,
+        dbus.bus.REQUEST_NAME_REPLY_ALREADY_OWNER,
+    )
+
+
+def wait_for_name(
+    bus: dbus.SessionBus,
+    lifecycle: dict[str, object],
+) -> bool:
+    loop = GLib.MainLoop()
+    acquired = {"value": False}
+
+    def name_owner_changed(_name: str, _old_owner: str, new_owner: str) -> None:
+        if new_owner or lifecycle["stopping"]:
+            return
+        if claim_name(bus):
+            acquired["value"] = True
+            loop.quit()
+
+    match = bus.add_signal_receiver(
+        name_owner_changed,
+        signal_name="NameOwnerChanged",
+        dbus_interface="org.freedesktop.DBus",
+        bus_name="org.freedesktop.DBus",
+        path="/org/freedesktop/DBus",
+        arg0=BUS_NAME,
+    )
+    standby_path = os.environ.get("KEYLIGHTS_TRAY_STANDBY_READY", "")
+    if standby_path:
+        Path(standby_path).touch()
+
+    lifecycle["loop"] = loop
+    if lifecycle["stopping"]:
+        pass
+    elif claim_name(bus):
+        acquired["value"] = True
+    else:
+        loop.run()
+    lifecycle["loop"] = None
+    match.remove()
+    return acquired["value"] and not lifecycle["stopping"]
+
+
+def register_with_watcher(bus: dbus.SessionBus, state: dict[str, int]) -> bool:
+    state["attempts"] += 1
+    try:
+        watcher = bus.get_object(WATCHER_NAME, WATCHER_PATH)
+        watcher.RegisterStatusNotifierItem(
+            BUS_NAME,
+            dbus_interface=WATCHER_INTERFACE,
+            timeout=2,
+        )
+        return False
+    except dbus.DBusException:
+        return state["attempts"] < WATCHER_MAX_ATTEMPTS
+
+
+def main() -> int:
+    test_mode = os.environ.get("KEYLIGHTS_TRAY_TEST", "")
+    if test_mode == "metadata":
+        print(json.dumps(metadata(), sort_keys=True))
+        return 0
+    if test_mode == "watcher-retry":
+        class MissingWatcherBus:
+            @staticmethod
+            def get_object(_name: str, _path: str) -> object:
+                raise dbus.DBusException("watcher unavailable")
+
+        retry_state = {"attempts": 0}
+        decisions = [
+            register_with_watcher(MissingWatcherBus(), retry_state)
+            for _ in range(WATCHER_MAX_ATTEMPTS)
+        ]
+        print(json.dumps({"attempts": retry_state["attempts"], "decisions": decisions}))
+        return 0
+
+    DBusGMainLoop(set_as_default=True)
+    try:
+        bus = dbus.SessionBus()
+    except dbus.DBusException:
+        return 5
+
+    lifecycle: dict[str, object] = {"loop": None, "stopping": False}
+    def stop(*_args: object) -> None:
+        lifecycle["stopping"] = True
+        active_loop = lifecycle["loop"]
+        if active_loop is not None:
+            active_loop.quit()
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+    if not claim_name(bus) and not wait_for_name(bus, lifecycle):
+        return 0
+
+    loop = GLib.MainLoop()
+    lifecycle["loop"] = loop
+
+    ready_path = os.environ.get("KEYLIGHTS_TRAY_READY", "")
+    if ready_path:
+        Path(ready_path).touch()
+
+    item = None
+    if test_mode != "hold":
+        item = StatusNotifierItem(bus)
+        if test_mode != "object":
+            watcher_state = {"attempts": 0}
+            if register_with_watcher(bus, watcher_state):
+                GLib.timeout_add_seconds(2, register_with_watcher, bus, watcher_state)
+
+    loop.run()
+    lifecycle["loop"] = None
+    if item is not None:
+        item.remove_from_connection()
+    bus.release_name(BUS_NAME)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
