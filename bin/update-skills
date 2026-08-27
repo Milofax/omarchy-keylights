@@ -114,21 +114,17 @@ def verify(root: Path) -> list[str]:
             current = digest_tree(directory)
             if current != metadata.get("sha256"):
                 errors.append(f"project skill content hash differs: {name}")
-    # Claude aliases are generated locally and intentionally not committed:
-    # Omarchy rejects plugins containing symlinks. Verify them when present,
-    # while still allowing --check to work in a fresh repository clone.
-    if links_dir.exists():
-        actual_links = {path.name for path in links_dir.iterdir()}
-        if actual_links != expected:
-            errors.append(
-                f"Claude link set differs: missing={sorted(expected - actual_links)}, "
-                f"unexpected={sorted(actual_links - expected)}"
-            )
-        for name in sorted(expected):
-            link = links_dir / name
-            target = f"../../.agents/skills/{name}"
-            if not link.is_symlink() or os.readlink(link) != target:
-                errors.append(f"invalid Claude skill link: {name}")
+    actual_links = {path.name for path in links_dir.iterdir()}
+    if actual_links != expected:
+        errors.append(
+            f"Claude link set differs: missing={sorted(expected - actual_links)}, "
+            f"unexpected={sorted(actual_links - expected)}"
+        )
+    for name in sorted(expected):
+        link = links_dir / name
+        target = f"../../.agents/skills/{name}"
+        if not link.is_symlink() or os.readlink(link) != target:
+            errors.append(f"invalid Claude skill link: {name}")
     return errors
 
 

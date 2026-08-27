@@ -92,12 +92,13 @@ Validate the repository with:
 
 Development checks require `shellcheck`, `node`, `ripgrep`, `qmllint`, `gdbus` (from GLib), and an Omarchy installation with its plugin validator. The suite replaces Avahi, curl, NetworkManager, Zenity, browser, and notification commands with temporary fixtures; it never contacts a real light or changes the host network. Set `KEYLIGHTS_TEST_REQUIRE_DBUS=1` to require the tray ownership/SIGTERM lifecycle test when a writable session D-Bus is available.
 
-Agent skills are vendored on the development branch under `.agents/skills` and
-locked by `skills-lock.json`. Run `bin/update-skills` to update them or
-`bin/update-skills --check` to verify them. The updater creates local
-`.claude/skills` aliases; those symlinks are ignored because Omarchy plugins
-may not contain symlinks. Release tags and plugin payloads intentionally omit
-all agent-skill tooling.
+Agent skills are vendored on the `main` development branch under
+`.agents/skills`, mirrored into Claude through tracked `.claude/skills`
+symlinks, and locked by `skills-lock.json`. Run `bin/update-skills` to update
+them or `bin/update-skills --check` to verify them. The public `plugin` branch
+is the default and contains only the installable plugin payload because
+Omarchy plugins may not contain symlinks. Release tags are cut exclusively
+from that skill-free branch.
 
 ## License
 
