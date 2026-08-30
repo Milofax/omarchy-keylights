@@ -86,7 +86,7 @@ while (( $# > 0 )); do
 done
 
 [[ "$method" == GET || "$method" == PUT ]] || exit 22
-[[ "$url" == http://127.0.0.1:9123/elgato/lights ]] || exit 28
+[[ "$url" == http://10.0.0.42:9123/elgato/lights ]] || exit 28
 
 # Model a lossy local network at the curl-process boundary: the first process
 # for each operation writes a partial response and fails; the second succeeds.
@@ -139,7 +139,7 @@ write_response "$(jq -cn --argjson state "$next" '{numberOfLights:1,lights:[$sta
 EOF
 chmod 0755 "$fake_bin/avahi-browse" "$fake_bin/curl"
 
-targets='[{"id":"SERIAL-1","discoveryId":"discovery-1","name":"Test Light","address":"127.0.0.1","port":9123}]'
+targets='[{"id":"SERIAL-1","discoveryId":"discovery-1","name":"Test Light","address":"10.0.0.42","port":9123}]'
 set +e
 result="$(PATH="$fake_bin:$PATH" KEYLIGHTS_LATENCY_STATE="$state_file" \
   KEYLIGHTS_LATENCY_LOG="$latency_file" KEYLIGHTS_LATENCY_CALLS="$calls_file" \
