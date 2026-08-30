@@ -5,6 +5,15 @@ readonly API_ROOT="/elgato"
 readonly API_PATH="$API_ROOT/lights"
 readonly INFO_PATH="$API_ROOT/accessory-info"
 readonly MAX_PARALLEL=8
+if [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+  default_preferences_file="$XDG_CONFIG_HOME/omarchy/keylights/preferences.json"
+elif [[ -n "${HOME:-}" ]]; then
+  default_preferences_file="$HOME/.config/omarchy/keylights/preferences.json"
+else
+  default_preferences_file=""
+fi
+readonly PREFERENCES_FILE="${KEYLIGHTS_PREFERENCES_FILE:-$default_preferences_file}"
+unset default_preferences_file
 
 usage() {
   cat <<'EOF'
@@ -12,12 +21,18 @@ Usage:
   keylights json
   keylights setup
   keylights control ACTION VALUE TARGETS_JSON
+  keylights preferences set DEVICE_ID DISCOVERY_ID POSITION NAME
+  keylights preferences clear DEVICE_ID
+  keylights preferences prompt DEVICE_ID DISCOVERY_ID POSITION CURRENT_NAME
+  keylights preferences order LIGHTS_JSON
   keylights [all|DEVICE_ID] status
   keylights [all|DEVICE_ID] on|off|toggle
   keylights [all|DEVICE_ID] brightness <1-100>
   keylights [all|DEVICE_ID] temperature <2900-7000>
 
-DEVICE_ID values are returned by `keylights json`.
+DEVICE_ID and DISCOVERY_ID values are returned by `keylights json`.
+POSITION is an integer from 0 through 9999. NAME must contain 1-64 characters;
+quote it when it contains spaces.
 EOF
 }
 
@@ -61,6 +76,188 @@ valid_port() {
   [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
 }
 
+valid_device_id() {
+  [[ "$1" =~ ^[[:alnum:]][[:alnum:]_.:-]{0,127}$ ]]
+}
+
+valid_preference_name() {
+  [[ ${#1} -le 64 && "$1" =~ [^[:space:]] && ! "$1" =~ [[:cntrl:]] ]]
+}
+
+load_preferences() {
+  local preferences_file="${1:-$PREFERENCES_FILE}"
+  if [[ -z "$preferences_file" || ! -e "$preferences_file" ]]; then
+    printf '%s\n' '{"version":1,"lights":{}}'
+    return
+  fi
+
+  jq -ce '
+    select(.version == 1)
+    | select((.lights | type) == "object")
+    | select(all(.lights[];
+        (.name | type) == "string" and (.name | length) > 0 and
+        (.order | type) == "number" and (.order | floor) == .order and .order >= 0 and
+        ((.discoveryId == null) or ((.discoveryId | type) == "string" and (.discoveryId | length) > 0))
+      ))
+  ' "$preferences_file" || {
+    printf 'Invalid Key Lights preferences: %s\n' "$preferences_file" >&2
+    return 2
+  }
+}
+
+preferences_write_path() {
+  if [[ -z "$PREFERENCES_FILE" ]]; then
+    printf 'XDG_CONFIG_HOME or HOME is required to save Key Lights preferences.\n' >&2
+    return 2
+  fi
+  if [[ -L "$PREFERENCES_FILE" ]]; then
+    realpath -- "$PREFERENCES_FILE" || {
+      printf 'The Key Lights preferences symlink has no valid target.\n' >&2
+      return 2
+    }
+  else
+    printf '%s\n' "$PREFERENCES_FILE"
+  fi
+}
+
+save_preference() (
+  local id="$1" discovery_id="$2" order="$3" name="$4"
+  local preferences preferences_file directory temporary order_number
+  if ! valid_device_id "$id" || ! valid_device_id "$discovery_id" ||
+      [[ ! "$order" =~ ^[0-9]{1,4}$ ]] || ! valid_preference_name "$name"; then
+    printf 'Invalid Key Light preference.\n' >&2
+    return 2
+  fi
+  order_number=$((10#$order))
+
+  preferences_file="$(preferences_write_path)" || return $?
+  directory="$(dirname -- "$preferences_file")"
+  umask 077
+  mkdir -p -- "$directory" || return 1
+  exec 9<"$directory" || return 1
+  flock -x 9 || return 1
+  preferences="$(load_preferences "$preferences_file")" || return $?
+  temporary="$(mktemp --tmpdir="$directory" .preferences.XXXXXX)" || return 1
+  trap 'rm -f -- "$temporary"' EXIT
+  jq -cn --argjson preferences "$preferences" --arg id "$id" --arg discoveryId "$discovery_id" --arg name "$name" \
+    --argjson order "$order_number" \
+    '$preferences | .lights[$id] = {discoveryId:$discoveryId, name:$name, order:$order}' >"$temporary" || return 1
+  chmod 0600 "$temporary" || return 1
+  mv -f -- "$temporary" "$preferences_file" || return 1
+  trap - EXIT
+)
+
+clear_preference() (
+  local id="$1" preferences preferences_file directory temporary
+  valid_device_id "$id" || {
+    printf 'Invalid Key Light device ID.\n' >&2
+    return 2
+  }
+
+  preferences_file="$(preferences_write_path)" || return $?
+  directory="$(dirname -- "$preferences_file")"
+  umask 077
+  mkdir -p -- "$directory" || return 1
+  exec 9<"$directory" || return 1
+  flock -x 9 || return 1
+  preferences="$(load_preferences "$preferences_file")" || return $?
+  temporary="$(mktemp --tmpdir="$directory" .preferences.XXXXXX)" || return 1
+  trap 'rm -f -- "$temporary"' EXIT
+  jq -cn --argjson preferences "$preferences" --arg id "$id" \
+    '$preferences | del(.lights[$id])' >"$temporary" || return 1
+  chmod 0600 "$temporary" || return 1
+  mv -f -- "$temporary" "$preferences_file" || return 1
+  trap - EXIT
+)
+
+save_preference_order() (
+  local lights="$1" preferences preferences_file directory temporary
+  jq -e '
+    . as $lights
+    | ($lights | type) == "array" and ($lights | length) > 0 and ($lights | length) <= 100 and
+    (($lights | map(.id) | unique | length) == ($lights | length)) and
+    all($lights[];
+      (.id | type) == "string" and (.id | test("^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")) and
+      (.discoveryId | type) == "string" and (.discoveryId | test("^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")) and
+      (.name | type) == "string" and (.name | length) > 0 and (.name | length) <= 64 and
+      (.name | test("[^[:space:]]")) and (.name | explode | all(. >= 32 and . != 127))
+    )
+  ' <<<"$lights" >/dev/null || {
+    printf 'Invalid Key Light order data.\n' >&2
+    return 2
+  }
+
+  preferences_file="$(preferences_write_path)" || return $?
+  directory="$(dirname -- "$preferences_file")"
+  umask 077
+  mkdir -p -- "$directory" || return 1
+  exec 9<"$directory" || return 1
+  flock -x 9 || return 1
+  preferences="$(load_preferences "$preferences_file")" || return $?
+  temporary="$(mktemp --tmpdir="$directory" .preferences.XXXXXX)" || return 1
+  trap 'rm -f -- "$temporary"' EXIT
+  jq -cn --argjson preferences "$preferences" --argjson lights "$lights" '
+    reduce range(0; $lights | length) as $index ($preferences;
+      ($lights[$index]) as $light
+      | .lights[$light.id] = {
+          discoveryId: $light.discoveryId,
+          name: $light.name,
+          order: $index
+        }
+    )
+  ' >"$temporary" || return 1
+  chmod 0600 "$temporary" || return 1
+  mv -f -- "$temporary" "$preferences_file" || return 1
+  trap - EXIT
+)
+
+prompt_preference() {
+  local id="$1" discovery_id="$2" order="$3" current_name="$4" name
+  command -v zenity >/dev/null || {
+    printf 'Zenity is required to rename a Key Light from the panel.\n' >&2
+    return 3
+  }
+  name="$(zenity --entry --title='Rename Key Light' --text='Choose a local name for this light' \
+    --entry-text="$current_name")" || return 0
+  save_preference "$id" "$discovery_id" "$order" "$name"
+}
+
+apply_preferences() {
+  local lights="$1" preferences
+  preferences="$(load_preferences 2>/dev/null)" || preferences='{"version":1,"lights":{}}'
+  jq -cn --argjson lights "$lights" --argjson preferences "$preferences" '
+    ($preferences.lights | to_entries) as $saved
+    | [$lights[]
+        | . as $light
+        | ($saved
+            | map(select(.key == $light.id or ((.value.discoveryId // "") == $light.discoveryId)))
+            | first // null
+          ) as $savedLight
+        | ($savedLight.value // {}) as $preference
+        | . + {
+            id: ($savedLight.key // .id),
+            originalName: .name,
+            name: (if ($preference.name | type) == "string" then $preference.name else .name end),
+            preferenceOrder: (if ($preference.order | type) == "number" then $preference.order else 10000 end)
+          }
+      ] as $discovered
+    | $discovered + [
+        $saved[]
+        | select(.key as $id | ($discovered | any(.id == $id)) | not)
+        | {
+            id: .key,
+            discoveryId: (.value.discoveryId // .key),
+            name: .value.name,
+            originalName: .value.name,
+            preferenceOrder: .value.order,
+            reachable: false,
+            on: 0
+          }
+      ]
+    | sort_by(.preferenceOrder, .name, .id)
+  '
+}
+
 discover_rows() {
   local browse_output
 
@@ -102,25 +299,61 @@ setup_available() {
     grep -Eq '^Elgato (Key|Ring) Light([[:space:]]|$)'
 }
 
-request_path() {
-  local method="$1" address="$2" port="$3" path="$4" payload="${5:-}"
+request_path() (
+  local profile="$1" method="$2" address="$3" port="$4" path="$5" payload="${6:-}"
+  local response_file curl_status=1 attempt attempt_limit=1
   local -a args=(
+    --disable
     --fail --silent --show-error
-    --connect-timeout 0.75 --max-time 1.5
-    --retry 4 --retry-delay 0 --retry-max-time 6 --retry-all-errors
-    --request "$method"
+    --noproxy '*'
   )
+
+  case "$profile" in
+    robust)
+      args+=(
+        --connect-timeout 0.75 --max-time 1.5
+        --retry 4 --retry-delay 0 --retry-max-time 6 --retry-all-errors
+      )
+      ;;
+    control)
+      args+=(
+        --connect-timeout 0.75 --max-time 1
+        --retry 0
+      )
+      attempt_limit=2
+      ;;
+    *)
+      printf 'Unknown request profile: %s\n' "$profile" >&2
+      return 2
+      ;;
+  esac
+  args+=(--request "$method")
 
   valid_ipv4 "$address" && valid_port "$port" || return 2
   if [[ -n "$payload" ]]; then
     args+=(--header 'Content-Type: application/json' --data "$payload")
   fi
 
-  curl "${args[@]}" "http://${address}:${port}${path}"
-}
+  response_file="$(mktemp --tmpdir keylights-response.XXXXXX)" || return 1
+  trap 'rm -f -- "$response_file"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  for ((attempt = 1; attempt <= attempt_limit; attempt++)); do
+    if curl "${args[@]}" --output "$response_file" "http://${address}:${port}${path}"; then
+      cat -- "$response_file"
+      return
+    else
+      curl_status=$?
+    fi
+  done
+  return "$curl_status"
+)
 
 read_info() {
-  request_path GET "$1" "$2" "$INFO_PATH" |
+  local profile="$1" address="$2" port="$3"
+  request_path "$profile" GET "$address" "$port" "$INFO_PATH" |
     jq -ce '
       select((.productName | type) == "string")
       | select(.productName | startswith("Elgato "))
@@ -129,12 +362,13 @@ read_info() {
 }
 
 read_state() {
-  request_path GET "$1" "$2" "$API_PATH" | jq -ce '.lights[0]'
+  local profile="$1" address="$2" port="$3"
+  request_path "$profile" GET "$address" "$port" "$API_PATH" | jq -ce '.lights[0]'
 }
 
 set_state() {
-  local address="$1" port="$2" payload="$3"
-  request_path PUT "$address" "$port" "$API_PATH" \
+  local profile="$1" address="$2" port="$3" payload="$4"
+  request_path "$profile" PUT "$address" "$port" "$API_PATH" \
     "$(jq -cn --argjson light "$payload" '{numberOfLights: 1, lights: [$light]}')" |
     jq -ce '.lights[0]'
 }
@@ -157,32 +391,32 @@ validate_action() {
 }
 
 perform_action() {
-  local address="$1" port="$2" action="$3" value="${4:-}"
+  local profile="$1" address="$2" port="$3" action="$4" value="${5:-}"
   local current payload
 
   case "$action" in
     status)
-      read_state "$address" "$port"
+      read_state "$profile" "$address" "$port"
       ;;
     on|off)
       [[ "$action" == on ]] && payload='{"on":1}' || payload='{"on":0}'
-      set_state "$address" "$port" "$payload"
+      set_state "$profile" "$address" "$port" "$payload"
       ;;
     toggle)
-      current="$(read_state "$address" "$port")" || return 1
+      current="$(read_state "$profile" "$address" "$port")" || return 1
       [[ "$(jq -r '.on' <<<"$current")" == 1 ]] && payload='{"on":0}' || payload='{"on":1}'
-      set_state "$address" "$port" "$payload"
+      set_state "$profile" "$address" "$port" "$payload"
       ;;
     brightness)
       payload="$(jq -cn --argjson brightness "$value" '{brightness:$brightness}')"
-      set_state "$address" "$port" "$payload"
+      set_state "$profile" "$address" "$port" "$payload"
       ;;
     temperature)
       local mired=$(((1000000 + value / 2) / value))
       (( mired > 344 )) && mired=344
       (( mired < 143 )) && mired=143
       payload="$(jq -cn --argjson temperature "$mired" '{temperature:$temperature}')"
-      set_state "$address" "$port" "$payload"
+      set_state "$profile" "$address" "$port" "$payload"
       ;;
   esac
 }
@@ -191,11 +425,11 @@ probe_device() {
   local advertised_id="$1" name="$2" address="$3" port="$4" host="$5"
   local info state id product
 
-  if info="$(read_info "$address" "$port" 2>/dev/null)"; then
+  if info="$(read_info robust "$address" "$port" 2>/dev/null)"; then
     id="$(jq -r '.serialNumber // empty' <<<"$info")"
     product="$(jq -r '.productName' <<<"$info")"
     [[ -n "$id" ]] || id="$advertised_id"
-    if state="$(read_state "$address" "$port" 2>/dev/null)"; then
+    if state="$(read_state robust "$address" "$port" 2>/dev/null)"; then
       jq -cn \
         --arg id "$id" --arg name "$name" --arg product "$product" --arg host "$host" \
         --arg address "$address" --argjson port "$port" --argjson state "$state" \
@@ -252,8 +486,9 @@ json_status() (
   done
 
   if (( ${#files[@]} > 0 )); then
-    lights="$(jq -sc 'sort_by(.name, .id)' "${files[@]}")" || return 1
+    lights="$(jq -sc '.' "${files[@]}")" || return 1
   fi
+  lights="$(apply_preferences "$lights")" || return $?
 
   jq -cn --argjson lights "$lights" --argjson setup "$setup" --argjson supported "$supported" \
     '{lights:$lights,setupAvailable:$setup,setupSupported:$supported,error:null}'
@@ -277,46 +512,14 @@ validate_targets() {
   done < <(jq -r '.[] | [.address, (.port | tostring)] | @tsv' <<<"$targets")
 }
 
-rediscover_target() {
-  local wanted_id="$1" id name address port host
-
-  while IFS=$'\t' read -r id name address port host; do
-    [[ "$id" == "$wanted_id" ]] || continue
-    printf '%s\t%s\n' "$address" "$port"
-    return 0
-  done < <(discover_rows 2>/dev/null)
-  return 1
-}
-
-verify_rediscovered_target() {
-  local address="$1" port="$2" expected_id="$3" discovery_id="$4" info serial
-
-  info="$(read_info "$address" "$port" 2>/dev/null)" || return 1
-  [[ "$expected_id" == "$discovery_id" ]] && return 0
-  serial="$(jq -r '.serialNumber // empty' <<<"$info")"
-  [[ -n "$serial" && "$serial" == "$expected_id" ]]
-}
-
 control_target() {
   local id="$1" discovery_id="$2" name="$3" address="$4" port="$5" action="$6" value="$7"
-  local state refreshed_address refreshed_port
+  local state
 
-  if state="$(perform_action "$address" "$port" "$action" "$value" 2>/dev/null)"; then
+  if state="$(perform_action control "$address" "$port" "$action" "$value" 2>/dev/null)"; then
     jq -cn \
       --arg id "$id" --arg discoveryId "$discovery_id" --arg name "$name" \
       --arg address "$address" --argjson port "$port" \
-      --argjson state "$state" \
-      '$state + {id:$id,discoveryId:$discoveryId,name:$name,address:$address,port:$port,reachable:true,ok:true}'
-    return
-  fi
-
-  if IFS=$'\t' read -r refreshed_address refreshed_port < <(rediscover_target "$discovery_id") &&
-      [[ "$refreshed_address:$refreshed_port" != "$address:$port" ]] &&
-      verify_rediscovered_target "$refreshed_address" "$refreshed_port" "$id" "$discovery_id" &&
-      state="$(perform_action "$refreshed_address" "$refreshed_port" "$action" "$value" 2>/dev/null)"; then
-    jq -cn \
-      --arg id "$id" --arg discoveryId "$discovery_id" --arg name "$name" \
-      --arg address "$refreshed_address" --argjson port "$refreshed_port" \
       --argjson state "$state" \
       '$state + {id:$id,discoveryId:$discoveryId,name:$name,address:$address,port:$port,reachable:true,ok:true}'
     return
@@ -403,14 +606,19 @@ run_discovered_action() {
 
   while IFS=$'\t' read -r id name address port host; do
     [[ -n "$id" ]] || continue
-    info="$(read_info "$address" "$port" 2>/dev/null)" || continue
+    info="$(read_info control "$address" "$port" 2>/dev/null)" || continue
     stable_id="$(jq -r '.serialNumber // empty' <<<"$info")"
     [[ -n "$stable_id" ]] || stable_id="$id"
-    [[ "$target" == all || "$target" == "$id" || "$target" == "$stable_id" ]] || continue
     targets="$(jq -cn --argjson targets "$targets" --arg id "$stable_id" --arg discoveryId "$id" --arg name "$name" \
       --arg address "$address" --argjson port "$port" \
       '$targets + [{id:$id,discoveryId:$discoveryId,name:$name,address:$address,port:$port}]')"
   done <<<"$rows"
+
+  targets="$(apply_preferences "$targets")" || return $?
+  if [[ "$target" != all ]]; then
+    targets="$(jq -c --arg target "$target" \
+      '[.[] | select(.id == $target or .discoveryId == $target or .name == $target)]' <<<"$targets")" || return 1
+  fi
 
   if [[ "$(jq 'length' <<<"$targets")" == 0 ]]; then
     printf 'No matching Key Light was found.\n' >&2
@@ -524,7 +732,8 @@ setup_flow() {
     return 1
   fi
 
-  if ! read_info 192.168.62.1 9123 >/dev/null 2>&1 || ! read_state 192.168.62.1 9123 >/dev/null 2>&1; then
+  if ! read_info robust 192.168.62.1 9123 >/dev/null 2>&1 ||
+      ! read_state robust 192.168.62.1 9123 >/dev/null 2>&1; then
     zenity --error --title='Set up Key Lights' \
       --text='The selected Wi-Fi network did not expose a compatible Elgato light. No credentials were entered.'
     return 1
@@ -560,6 +769,34 @@ main() {
       (( $# == 4 )) || { printf 'Invalid control request.\n' >&2; return 2; }
       control_targets "$2" "$3" "$4"
       return
+      ;;
+    preferences)
+      case "${2:-}" in
+        set)
+          (( $# == 6 )) || { usage >&2; return 2; }
+          save_preference "$3" "$4" "$5" "$6"
+          return
+          ;;
+        clear)
+          (( $# == 3 )) || { usage >&2; return 2; }
+          clear_preference "$3"
+          return
+          ;;
+        prompt)
+          (( $# == 6 )) || { usage >&2; return 2; }
+          prompt_preference "$3" "$4" "$5" "$6"
+          return
+          ;;
+        order)
+          (( $# == 3 )) || { usage >&2; return 2; }
+          save_preference_order "$3"
+          return
+          ;;
+        *)
+          usage >&2
+          return 2
+          ;;
+      esac
       ;;
     -h|--help|help)
       usage

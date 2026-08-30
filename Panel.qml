@@ -42,7 +42,7 @@ Panel {
   property string statusOutputText: ""
   property string statusErrorText: ""
   property bool refreshPending: false
-  property bool trayMode: true
+  property bool trayMode: false
   property int trayWantedConfirmations: 0
   property bool trayStopRequested: false
   property bool trayTerminal: false
@@ -67,6 +67,18 @@ Panel {
   readonly property bool trayWanted: Logic.trayWanted(lights)
   readonly property bool trayUnavailable: trayMode && trayErrorText !== ""
   readonly property bool missing: errorText !== "" || trayUnavailable || setupAvailable || (lights.length > 0 && !allReachable)
+  readonly property bool iconCrossed: Logic.iconCrossed(
+    lights,
+    errorText !== "" ? errorText : trayErrorText,
+    statusInFlight
+  )
+  readonly property string warningSummary: {
+    if (trayUnavailable) return trayErrorText
+    if (errorText !== "") return errorText
+    if (setupAvailable) return "An unconfigured Key Light is ready to set up."
+    if (lights.length > 0 && !allReachable) return "One or more lights are not reachable."
+    return ""
+  }
   readonly property var brightnessState: Logic.brightnessSummary(lights)
   readonly property int brightnessPercent: Number(brightnessState.value)
   readonly property bool brightnessMixed: brightnessState.mixed === true
@@ -83,13 +95,13 @@ Panel {
     return settingsMixed ? status + " · Mixed settings" : status + " · " + brightnessPercent + "% · " + temperatureKelvin + " K"
   }
 
-  visible: !trayMode || trayUnavailable
+  visible: opened || !trayMode || trayUnavailable
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
   function refresh() {
     if (Logic.operationBusy(statusInFlight, actionProcess.running, setupProcess.running,
-                            commandQueue.length, activeCommand)) {
+                            commandQueue.length, activeCommand) || preferenceProcess.running) {
       refreshPending = true
       return
     }
@@ -132,6 +144,8 @@ Panel {
       id: light.id,
       discoveryId: light.discoveryId,
       name: light.name,
+      originalName: light.originalName,
+      preferenceOrder: light.preferenceOrder,
       product: light.product,
       host: light.host,
       address: light.address,
@@ -272,8 +286,13 @@ Panel {
     if (actionExitCode !== 0 && (actionOutputText.trim() !== "" || actionErrorText.trim() === ""))
       errorText = Logic.actionError(actionExitCode)
 
+    var actionFailed = actionExitCode !== 0
     activeCommand = null
-    if (commandQueue.length > 0) {
+    if (actionFailed) {
+      commandQueue = []
+      refreshPending = true
+      Qt.callLater(refresh)
+    } else if (commandQueue.length > 0) {
       Qt.callLater(startNextCommand)
     } else {
       refreshPending = true
@@ -311,9 +330,53 @@ Panel {
     return status + " · " + Math.round(Number(light.brightness || 20)) + "% · " + kelvin + " K"
   }
 
+  function saveLightName(light, index, name) {
+    var normalized = Logic.normalizedLightName(name)
+    if (!light || preferenceProcess.running) return false
+    if (normalized === "") {
+      errorText = "The Key Light name cannot be empty."
+      return false
+    }
+    preferenceProcess.command = [
+      tool,
+      "preferences",
+      "set",
+      String(light.id),
+      String(light.discoveryId || light.id),
+      String(index),
+      normalized
+    ]
+    var renamed = lights.slice()
+    var updated = {}
+    for (var key in light) updated[key] = light[key]
+    updated.name = normalized
+    renamed[index] = updated
+    lights = renamed
+    errorText = ""
+    preferenceProcess.running = true
+    return true
+  }
+
+  function moveLight(index, destination) {
+    if (preferenceProcess.running || index < 0 || destination < 0 || destination >= lights.length) return
+    var ordered = Logic.moveLight(lights, index, destination)
+    if (index === destination) return
+    lights = ordered
+    var preferences = []
+    for (var i = 0; i < ordered.length; i++) {
+      preferences.push({
+        id: String(ordered[i].id),
+        discoveryId: String(ordered[i].discoveryId || ordered[i].id),
+        name: String(ordered[i].name || "Key Light")
+      })
+    }
+    preferenceProcess.command = [tool, "preferences", "order", JSON.stringify(preferences)]
+    preferenceProcess.running = true
+  }
+
   function startSetup() {
     if (Logic.operationBusy(statusInFlight, actionProcess.running, setupProcess.running,
-                            commandQueue.length, activeCommand)) {
+                            commandQueue.length, activeCommand) || preferenceProcess.running) {
       noticeText = "Wait for the current Key Light operation to finish."
       return
     }
@@ -422,7 +485,16 @@ Panel {
       )
       return
     }
-    scheduleTrayRetry("", "")
+    scheduleTrayRetry(
+      "System tray support stopped unexpectedly; tray support will retry.",
+      ""
+    )
+  }
+
+  function handleTrayOutput(output) {
+    if (!trayProcess.running || !trayMode || String(output || "").trim() !== "ready") return
+    trayErrorText = ""
+    trayHealthy.restart()
   }
 
   Component.onCompleted: {
@@ -479,14 +551,8 @@ Panel {
     id: trayProcess
     running: false
     command: [root.trayTool]
-    onRunningChanged: {
-      if (running) {
-        root.trayErrorText = ""
-        trayHealthy.restart()
-      } else {
-        trayHealthy.stop()
-      }
-    }
+    stdout: SplitParser { onRead: function(line) { root.handleTrayOutput(line) } }
+    onRunningChanged: if (!running) trayHealthy.stop()
     onExited: function(exitCode) { root.handleTrayExit(exitCode) }
   }
 
@@ -514,6 +580,16 @@ Panel {
     }
   }
 
+  Process {
+    id: preferenceProcess
+    running: false
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.errorText = "Could not save the Key Light name or order."
+      root.refreshPending = true
+      Qt.callLater(root.refresh)
+    }
+  }
+
   IpcHandler {
     target: root.ipcTarget
     function open(): void { root.open() }
@@ -531,8 +607,10 @@ Panel {
     function state(): string {
       return JSON.stringify({
         visible: root.visible,
+        opened: root.opened,
         reachable: root.anyReachable,
         on: root.anyOn,
+        crossed: root.iconCrossed,
         lights: root.lights,
         setupAvailable: root.setupAvailable,
         error: root.errorText !== "" ? root.errorText : root.trayErrorText
@@ -550,11 +628,11 @@ Panel {
         iconSize: Style.bar.iconFont
         iconColor: root.barForeground
         lit: root.anyOn
-        crossed: Logic.connectionLost(root.lights)
+        crossed: root.iconCrossed
         missing: root.missing
       }
     }
-    tooltipText: "Key Lights · " + root.stateSummary
+    tooltipText: "Key Lights · " + (root.warningSummary !== "" ? root.warningSummary : root.stateSummary)
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.MiddleButton) root.runCommand("all", "toggle")
       else if (buttonCode === Qt.RightButton) root.runCommand("all", "off")
@@ -607,7 +685,7 @@ Panel {
               iconSize: Style.font.heading
               iconColor: root.foreground
               lit: root.anyOn
-              crossed: Logic.connectionLost(root.lights)
+              crossed: root.iconCrossed
               missing: root.missing
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
@@ -645,51 +723,36 @@ Panel {
           Repeater {
             model: root.lights
 
-            delegate: Item {
+            delegate: LightControlRow {
               required property var modelData
+              required property int index
               width: contentColumn.width
-              implicitHeight: Style.space(38)
-
-              Column {
-                anchors.left: parent.left
-                anchors.right: lightSwitch.left
-                anchors.rightMargin: Style.space(8)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: 0
-
-                Text {
-                  text: root.lightLabel(modelData)
-                  textFormat: Text.PlainText
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  font.bold: true
-                  width: parent.width
-                  elide: Text.ElideRight
-                }
-
-                Text {
-                  text: root.lightStatus(modelData)
-                  textFormat: Text.PlainText
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
+              light: modelData
+              rowIndex: index
+              rowCount: root.lights.length
+              rowSpacing: contentColumn.spacing
+              preferenceBusy: preferenceProcess.running
+              actionBusy: actionProcess.running
+              foreground: root.foreground
+              accent: root.urgent
+              dim: root.dim
+              fontFamily: root.fontFamily
+              rowHeight: Style.space(38)
+              dragHandleWidth: Style.space(22)
+              actionSize: Style.space(26)
+              bodyFontSize: Style.font.body
+              captionFontSize: Style.font.caption
+              iconFontSize: Style.font.icon
+              controlGap: Style.space(6)
+              displayName: root.lightLabel(modelData)
+              statusText: root.lightStatus(modelData)
+              cancelFocusTarget: keyCatcher
+              onMoveRequested: function(fromIndex, toIndex) { root.moveLight(fromIndex, toIndex) }
+              onRenameRequested: function(light, rowIndex, name) {
+                if (root.saveLightName(light, rowIndex, name)) editingName = false
               }
-
-              ToggleSwitch {
-                id: lightSwitch
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                checked: modelData.reachable === true && Number(modelData.on) === 1
-                busy: actionProcess.running
-                enabled: modelData.reachable === true
-                opacity: enabled ? 1 : 0.45
-                foreground: root.foreground
-                accent: root.urgent
-                trackHeight: Style.space(18)
-                cursorPad: Style.space(4)
-                onToggled: root.runCommand(modelData.id, checked ? "off" : "on")
+              onToggleRequested: function(light, currentlyChecked) {
+                root.runCommand(light.id, currentlyChecked ? "off" : "on")
               }
             }
           }
@@ -817,9 +880,13 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
-          PanelSeparator { foreground: root.foreground }
+          PanelSeparator {
+            visible: Logic.setupVisible(root.setupAvailable)
+            foreground: root.foreground
+          }
 
           Item {
+            visible: Logic.setupVisible(root.setupAvailable)
             width: parent.width
             implicitHeight: Style.space(28)
 
@@ -873,11 +940,21 @@ Panel {
     Rectangle {
       visible: parent.crossed
       anchors.centerIn: parent
-      width: parent.width * 1.18
+      width: parent.width * 1.05
       height: Math.max(2, parent.height * 0.12)
       radius: height / 2
       color: parent.iconColor
       rotation: -45
+    }
+
+    Rectangle {
+      visible: parent.crossed
+      anchors.centerIn: parent
+      width: parent.width * 1.05
+      height: Math.max(2, parent.height * 0.12)
+      radius: height / 2
+      color: parent.iconColor
+      rotation: 45
     }
 
     Text {
