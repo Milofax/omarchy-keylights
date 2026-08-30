@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+work_dir="$(mktemp -d)"
+fake_bin="$work_dir/bin"
+state_file="$work_dir/state.json"
+latency_file="$work_dir/latency-ms"
+calls_file="$work_dir/calls"
+avahi_calls_file="$work_dir/avahi-calls"
+driver="${KEYLIGHTS_DRIVER:-$root/bin/keylights}"
+action="${KEYLIGHTS_LATENCY_ACTION:-on}"
+force_failure="${KEYLIGHTS_LATENCY_FORCE_FAILURE:-0}"
+initial_on=0
+expected_on=1
+expected_calls=2
+expected_sequence=$'PUT attempt=1\nPUT attempt=2'
+
+case "$action" in
+  on) ;;
+  off)
+    initial_on=1
+    expected_on=0
+    ;;
+  toggle)
+    expected_calls=4
+    expected_sequence=$'GET attempt=1\nGET attempt=2\nPUT attempt=1\nPUT attempt=2'
+    ;;
+  *)
+    printf 'FAIL: unsupported latency action: %s\n' "$action" >&2
+    exit 2
+    ;;
+esac
+
+cleanup() {
+  rm -r -- "$work_dir"
+}
+trap cleanup EXIT
+
+fail() {
+  printf 'FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+mkdir -p -- "$fake_bin"
+jq -cn --argjson on "$initial_on" \
+  '{on:$on,brightness:20,temperature:220}' >"$state_file"
+printf '0\n' >"$latency_file"
+: >"$calls_file"
+: >"$avahi_calls_file"
+
+cat >"$fake_bin/avahi-browse" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'called\n' >>"$KEYLIGHTS_LATENCY_AVAHI_CALLS"
+exit 1
+EOF
+
+cat >"$fake_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+first_argument="${1:-}"
+method=GET
+payload=''
+max_time=0
+retry_count=unset
+retry_max_time=unset
+output=''
+noproxy=unset
+url=''
+
+while (( $# > 0 )); do
+  case "$1" in
+    --disable) shift ;;
+    --request) method="$2"; shift 2 ;;
+    --data) payload="$2"; shift 2 ;;
+    --max-time) max_time="$2"; shift 2 ;;
+    --noproxy) noproxy="$2"; shift 2 ;;
+    --output) output="$2"; shift 2 ;;
+    --retry) retry_count="$2"; shift 2 ;;
+    --retry-max-time) retry_max_time="$2"; shift 2 ;;
+    http://*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+
+[[ "$method" == GET || "$method" == PUT ]] || exit 22
+[[ "$url" == http://127.0.0.1:9123/elgato/lights ]] || exit 28
+
+# Model a lossy local network at the curl-process boundary: the first process
+# for each operation writes a partial response and fails; the second succeeds.
+# A successful read may still take its full attempt budget before a following
+# write can start. Scale the clock 100x so the test stays fast.
+attempt=$(( $(awk -v method="$method" '$1 == method { count++ } END { print count + 0 }' \
+  "$KEYLIGHTS_LATENCY_CALLS") + 1 ))
+output_mode=stdout
+if [[ -n "$output" ]]; then
+  [[ -f "$output" ]] || exit 23
+  output_mode=regular
+fi
+printf '%s attempt=%s retry=%s max-time=%s retry-max-time=%s output=%s disable=%s noproxy=%s\n' \
+  "$method" "$attempt" "$retry_count" "$max_time" "$retry_max_time" "$output_mode" \
+  "$([[ "$first_argument" == --disable ]] && printf first || printf no)" "$noproxy" \
+  >>"$KEYLIGHTS_LATENCY_CALLS"
+
+write_response() {
+  local body="$1"
+  if [[ -n "$output" ]]; then
+    printf '%s' "$body" >"$output"
+  else
+    printf '%s' "$body"
+  fi
+}
+
+virtual_seconds=0
+if [[ "${KEYLIGHTS_LATENCY_FORCE_FAILURE:-0}" == 1 ]] || (( attempt == 1 )) || [[ "$method" == GET ]]; then
+  virtual_seconds="$max_time"
+fi
+scaled_seconds="$(awk -v delay="$virtual_seconds" 'BEGIN { printf "%.3f", delay / 100 }')"
+sleep "$scaled_seconds"
+
+awk -v current="$(<"$KEYLIGHTS_LATENCY_LOG")" -v delay="$virtual_seconds" \
+  'BEGIN { printf "%.0f\n", current + delay * 1000 }' >"$KEYLIGHTS_LATENCY_LOG.next"
+mv "$KEYLIGHTS_LATENCY_LOG.next" "$KEYLIGHTS_LATENCY_LOG"
+
+if [[ "${KEYLIGHTS_LATENCY_FORCE_FAILURE:-0}" == 1 ]] || (( attempt == 1 )); then
+  write_response '{"lights":['
+  exit 18
+fi
+
+next="$(<"$KEYLIGHTS_LATENCY_STATE")"
+if [[ "$method" == PUT ]]; then
+  next="$(jq -cn --argjson current "$next" \
+    --argjson payload "$payload" '$current * $payload.lights[0]')"
+  printf '%s\n' "$next" >"$KEYLIGHTS_LATENCY_STATE"
+fi
+write_response "$(jq -cn --argjson state "$next" '{numberOfLights:1,lights:[$state]}')"
+EOF
+chmod 0755 "$fake_bin/avahi-browse" "$fake_bin/curl"
+
+targets='[{"id":"SERIAL-1","discoveryId":"discovery-1","name":"Test Light","address":"127.0.0.1","port":9123}]'
+set +e
+result="$(PATH="$fake_bin:$PATH" KEYLIGHTS_LATENCY_STATE="$state_file" \
+  KEYLIGHTS_LATENCY_LOG="$latency_file" KEYLIGHTS_LATENCY_CALLS="$calls_file" \
+  KEYLIGHTS_LATENCY_AVAHI_CALLS="$avahi_calls_file" \
+  "$driver" control "$action" - "$targets")"
+driver_status=$?
+set -e
+if [[ "$force_failure" == 1 ]]; then
+  (( driver_status == 1 )) || fail "$action failure returned status $driver_status instead of 1"
+  jq -e '.failures == 1 and .results[0].ok == false' <<<"$result" >/dev/null || \
+    fail "$action failure did not return a structured device failure"
+  jq -e --argjson expected "$initial_on" '.on == $expected' "$state_file" >/dev/null || \
+    fail 'a failed action changed the fixture light'
+  [[ ! -s "$avahi_calls_file" ]] || \
+    fail 'a failed command synchronously entered slow mDNS discovery'
+else
+  (( driver_status == 0 )) || fail "$action command failed after its first curl process error"
+  jq -e --argjson expected "$expected_on" \
+    '.failures == 0 and .results[0].ok == true and .results[0].on == $expected' \
+    <<<"$result" >/dev/null || fail "the fixture light did not reach state $expected_on"
+  jq -e --argjson expected "$expected_on" '.on == $expected' "$state_file" >/dev/null || \
+    fail 'the action never reached the fixture light'
+fi
+
+actual_calls="$(wc -l <"$calls_file")"
+(( actual_calls == expected_calls )) || \
+  fail "$action used $actual_calls curl processes; expected exactly $expected_calls"
+actual_sequence="$(awk '{ print $1 " " $2 }' "$calls_file")"
+[[ "$actual_sequence" == "$expected_sequence" ]] || \
+  fail "$action used an unexpected curl process sequence: $actual_sequence"
+awk '$3 != "retry=0" || $4 != "max-time=1" || $5 != "retry-max-time=unset" { exit 1 }' \
+  "$calls_file" || fail "$action delegated control retries or backoff to curl"
+awk '$6 != "output=regular" { exit 1 }' "$calls_file" || \
+  fail "$action did not isolate every curl response in a regular output file"
+awk '$7 != "disable=first" || $8 != "noproxy=*" { exit 1 }' "$calls_file" || \
+  fail "$action allowed curl configuration or proxies to alter local control requests"
+
+latency_ms="$(<"$latency_file")"
+maximum_ms="${KEYLIGHTS_LATENCY_MAXIMUM_MS:-2000}"
+if [[ "${KEYLIGHTS_LATENCY_VERBOSE:-0}" == 1 ]]; then
+  printf 'TRACE: action=%s calls=%s latency=%sms\n' \
+    "$action" "$(wc -l <"$calls_file")" "$latency_ms"
+  sed 's/^/TRACE: /' "$calls_file"
+fi
+if (( latency_ms > maximum_ms )); then
+  fail "$action command reached the light after ${latency_ms}ms; expected at most ${maximum_ms}ms"
+fi
+
+if [[ "$force_failure" == 1 ]]; then
+  printf 'PASS: failed %s command returned after %sms without waiting for mDNS (limit %sms)\n' \
+    "$action" "$latency_ms" "$maximum_ms"
+else
+  printf 'PASS: %s command reached the light after %sms (limit %sms)\n' \
+    "$action" "$latency_ms" "$maximum_ms"
+fi

@@ -8,6 +8,7 @@ state_file="$work_dir/state.json"
 setup_log="$work_dir/setup-log"
 setup_pid=""
 runtime_pid=""
+export KEYLIGHTS_PREFERENCES_FILE="$work_dir/default-preferences.json"
 
 cleanup() {
   if [[ -n "$setup_pid" ]]; then kill -TERM -- "-$setup_pid" 2>/dev/null || true; fi
@@ -26,30 +27,43 @@ assert_jq() {
   jq -e "$expression" <<<"$json" >/dev/null || fail "$message"
 }
 
-for required_command in shellcheck node rg qmllint gdbus; do
+for required_command in shellcheck node rg qmllint gdbus dbus-run-session flock realpath; do
   command -v "$required_command" >/dev/null || fail "required development command is missing: $required_command"
 done
 
 payload_dir="$work_dir/plugin-payload"
-mkdir -p "$payload_dir/bin" "$payload_dir/icons"
-for release_file in LICENSE README.md Panel.qml KeyLightsLogic.js manifest.json \
-    bin/keylights bin/keylights-tray icons/io.github.milofax.keylights-symbolic.svg; do
+mkdir -p "$payload_dir/bin" "$payload_dir/icons" "$payload_dir/screenshots"
+for release_file in LICENSE README.md Panel.qml LightControlRow.qml KeyLightsLogic.js manifest.json \
+    bin/keylights bin/keylights-tray icons/io.github.milofax.keylights-symbolic.svg \
+    screenshots/keylights-panel.png; do
   [[ -f "$root/$release_file" && ! -L "$root/$release_file" ]] || \
     fail "release payload file is missing or a symlink: $release_file"
 done
-cp "$root/LICENSE" "$root/README.md" "$root/Panel.qml" "$root/KeyLightsLogic.js" \
+cp "$root/LICENSE" "$root/README.md" "$root/Panel.qml" "$root/LightControlRow.qml" "$root/KeyLightsLogic.js" \
   "$root/manifest.json" "$payload_dir/"
 cp "$root/bin/keylights" "$root/bin/keylights-tray" "$payload_dir/bin/"
 cp "$root/icons/io.github.milofax.keylights-symbolic.svg" "$payload_dir/icons/"
+cp "$root/screenshots/keylights-panel.png" "$payload_dir/screenshots/"
 
 bash -n "$root/bin/keylights"
 shellcheck "$root/bin/keylights"
+bash -n "$root/tests/toggle-latency"
+shellcheck "$root/tests/toggle-latency"
 shellcheck "$root/tests/run"
 PYTHONPYCACHEPREFIX="$work_dir/pycache" python3 -m py_compile "$root/bin/keylights-tray"
+PYTHONPYCACHEPREFIX="$work_dir/pycache" python3 -m py_compile "$root/tests/tray-restart-repro.py"
 jq empty "$root/manifest.json"
 omarchy plugin validate "$payload_dir"
 qmllint -I /usr/share/omarchy/shell "$root/Panel.qml" >"$work_dir/qmllint.log" 2>&1 || \
   fail 'qmllint rejected Panel.qml'
+qmllint -I /usr/share/omarchy/shell "$root/LightControlRow.qml" >>"$work_dir/qmllint.log" 2>&1 || \
+  fail 'qmllint rejected LightControlRow.qml'
+env -u DISPLAY -u QT_QPA_PLATFORMTHEME QT_QPA_PLATFORM=offscreen \
+  QT_QUICK_BACKEND=software QT_STYLE_OVERRIDE=Basic \
+  /usr/lib/qt6/bin/qmltestrunner -input "$root/tests/qml" || \
+  fail 'the rendered light-row interaction tests failed'
+env -u HOME -u XDG_CONFIG_HOME -u KEYLIGHTS_PREFERENCES_FILE \
+  "$root/bin/keylights" --help >/dev/null || fail 'the CLI required HOME even when no preferences were being saved'
 
 node - "$root/KeyLightsLogic.js" <<'EOF'
 const assert = require("node:assert/strict")
@@ -68,8 +82,8 @@ assert.equal(Logic.trayWanted(on), false)
 assert.equal(Logic.barVisible(off), false)
 assert.equal(Logic.trayWanted(off), true)
 assert.equal(Logic.barVisible(unreachable), false)
-assert.equal(Logic.trayWanted(unreachable), true)
-assert.equal(Logic.trayWanted([]), true)
+assert.equal(Logic.trayWanted(unreachable), false)
+assert.equal(Logic.trayWanted([]), false)
 assert.deepEqual(Logic.advanceTrayMode(false, true, 0), {trayMode: false, confirmations: 1})
 assert.deepEqual(Logic.advanceTrayMode(false, true, 1), {trayMode: true, confirmations: 0})
 assert.deepEqual(Logic.advanceTrayMode(true, false, 0), {trayMode: false, confirmations: 0})
@@ -82,6 +96,12 @@ assert.equal(Logic.connectionLost(off), false)
 assert.equal(Logic.connectionLost(unreachable), true)
 assert.equal(Logic.connectionLost(mixed), false)
 assert.equal(Logic.connectionLost([]), false)
+assert.equal(Logic.iconCrossed(unreachable, "", false), true)
+assert.equal(Logic.iconCrossed([], "Discovery failed.", false), true)
+assert.equal(Logic.iconCrossed([], "", false), true)
+assert.equal(Logic.iconCrossed([], "", true), false)
+assert.equal(Logic.setupVisible(false), false)
+assert.equal(Logic.setupVisible(true), true)
 assert.equal(Logic.shouldPoll(false, []), false)
 assert.equal(Logic.shouldPoll(false, off), true)
 assert.equal(Logic.shouldPoll(true, []), true)
@@ -105,24 +125,65 @@ const reconciled = Logic.reconcileLights(on, unreachable)
 assert.equal(reconciled[0].id, "SERIAL-1")
 assert.equal(reconciled[0].discoveryId, "discovery-1")
 
+const previouslyKnown = [
+  {id: "SERIAL-1", discoveryId: "discovery-1", reachable: true, on: 0},
+  {id: "SERIAL-2", discoveryId: "discovery-2", reachable: true, on: 0},
+]
+const partialDiscovery = Logic.reconcileLights(previouslyKnown, [previouslyKnown[0]])
+assert.deepEqual(
+  partialDiscovery.map(light => ({id: light.id, reachable: light.reachable})),
+  [
+    {id: "SERIAL-1", reachable: true},
+    {id: "SERIAL-2", reachable: false},
+  ],
+)
+
+const preferredPrevious = [
+  {id: "SERIAL-1", discoveryId: "discovery-1", name: "Links", originalName: "Elgato Key Light 94D7", preferenceOrder: 0, reachable: true},
+  {id: "SERIAL-2", discoveryId: "discovery-2", name: "Rechts", originalName: "Elgato Key Light 8C62", preferenceOrder: 1, reachable: true},
+]
+const rawPartial = [
+  {id: "SERIAL-2", discoveryId: "discovery-2", name: "Rechts", originalName: "Elgato Key Light 8C62", preferenceOrder: 1, reachable: true},
+  {id: "discovery-1", discoveryId: "discovery-1", name: "Elgato Key Light 94D7", preferenceOrder: 10000, reachable: false},
+]
+assert.deepEqual(
+  Logic.reconcileLights(preferredPrevious, rawPartial).map(light => ({id: light.id, name: light.name, order: light.preferenceOrder, reachable: light.reachable})),
+  [
+    {id: "SERIAL-1", name: "Links", order: 0, reachable: false},
+    {id: "SERIAL-2", name: "Rechts", order: 1, reachable: true},
+  ],
+)
+
 const queued = [{targets: [{id: "SERIAL-1", discoveryId: "discovery-1", address: "10.0.0.99", port: 9123}]}]
 const refreshed = Logic.refreshQueuedTargets(queued, [{id: "SERIAL-1", discoveryId: "discovery-1", address: "10.0.0.10", port: 9123, ok: true}])
 assert.equal(refreshed[0].targets[0].address, "10.0.0.10")
 assert.equal(Logic.actionError(2), "The Key Light command was rejected before contacting any device.")
 assert.equal(Logic.actionError(1), "One or more lights did not respond. Please try again.")
+
+const reordered = Logic.moveLight(preferredPrevious, 0, 1)
+assert.deepEqual(reordered.map(light => light.id), ["SERIAL-2", "SERIAL-1"])
+assert.deepEqual(preferredPrevious.map(light => light.id), ["SERIAL-1", "SERIAL-2"])
+assert.equal(Logic.normalizedLightName("  Desk left  "), "Desk left")
+assert.equal(Logic.normalizedLightName("   "), "")
 EOF
+
+"$root/tests/toggle-latency"
+KEYLIGHTS_LATENCY_ACTION=off "$root/tests/toggle-latency"
+KEYLIGHTS_LATENCY_ACTION=toggle KEYLIGHTS_LATENCY_MAXIMUM_MS=3000 \
+  "$root/tests/toggle-latency"
+KEYLIGHTS_LATENCY_FORCE_FAILURE=1 "$root/tests/toggle-latency"
 
 tray_metadata="$(KEYLIGHTS_TRAY_TEST=metadata "$root/bin/keylights-tray")"
 assert_jq "$tray_metadata" '.busName == "io.github.milofax.KeyLights.Tray"' 'tray helper does not use a stable duplicate-prevention bus name'
 assert_jq "$tray_metadata" '.activate == "open" and .secondaryActivate == "toggleAll" and .contextMenu == "lightsOff"' \
   'tray helper IPC mapping is incomplete'
 tray_retry="$(KEYLIGHTS_TRAY_TEST=watcher-retry "$root/bin/keylights-tray")"
-assert_jq "$tray_retry" '.attempts == 15 and (.decisions | length) == 15 and .decisions[0] == true and .decisions[14] == false' \
+assert_jq "$tray_retry" '.attempts == 3 and (.decisions | length) == 3 and .decisions[0] == true and .decisions[2] == false' \
   'tray watcher registration does not stop after its bounded retry budget'
 
-if python3 -c 'import dbus; dbus.SessionBus()' 2>/dev/null; then
+if dbus-run-session -- python3 -c 'import dbus; dbus.SessionBus()' 2>/dev/null; then
   # shellcheck disable=SC2016
-  bash -euo pipefail -c '
+  dbus-run-session -- bash -euo pipefail -c '
   helper="$1"
   test_dir="$2"
   first_ready="$test_dir/tray-first-ready"
@@ -179,8 +240,11 @@ if python3 -c 'import dbus; dbus.SessionBus()' 2>/dev/null; then
   wait "$object_pid"
   object_pid=""
 ' _ "$root/bin/keylights-tray" "$work_dir"
+  dbus-run-session -- python3 "$root/tests/tray-restart-repro.py"
 elif [[ "${KEYLIGHTS_TEST_REQUIRE_DBUS:-0}" == 1 ]]; then
-  fail 'session D-Bus is unavailable for the tray lifecycle test'
+  fail 'an isolated writable session D-Bus is unavailable for the tray lifecycle tests'
+else
+  printf 'Skipping tray lifecycle tests: an isolated writable session D-Bus is unavailable.\n'
 fi
 
 [[ -x "$root/bin/keylights" ]] || fail 'bin/keylights is not executable'
@@ -189,15 +253,32 @@ fi
 [[ -z "$(find "$payload_dir" -type l -print -quit)" ]] || fail 'release payload contains a symlink'
 
 grep -q '"id": "io.github.milofax.keylights"' "$root/manifest.json"
-grep -q '"version": "1.1.0"' "$root/manifest.json"
+grep -q '"version": "1.4.2"' "$root/manifest.json"
 grep -q 'moduleName: "io.github.milofax.keylights"' "$root/Panel.qml"
 grep -q 'ipcTarget: "io.github.milofax.keylights"' "$root/Panel.qml"
 grep -Fq 'import "KeyLightsLogic.js" as Logic' "$root/Panel.qml"
-grep -Fq 'visible: !trayMode || trayUnavailable' "$root/Panel.qml"
+grep -Fq 'visible: opened || !trayMode || trayUnavailable' "$root/Panel.qml"
+grep -Fq 'property bool trayMode: false' "$root/Panel.qml"
 grep -Fq 'readonly property bool trayWanted: Logic.trayWanted(lights)' "$root/Panel.qml"
 grep -Fq 'Logic.advanceTrayMode(trayMode, trayWanted, trayWantedConfirmations)' "$root/Panel.qml"
 grep -Fq 'Logic.trayExitAction(exitCode, trayStopRequested, trayMode)' "$root/Panel.qml"
 grep -Fq 'trayRetryCount >= trayRetryLimit' "$root/Panel.qml"
+grep -Fq 'System tray support stopped unexpectedly; tray support will retry.' "$root/Panel.qml"
+grep -Fq 'stdout: SplitParser { onRead: function(line) { root.handleTrayOutput(line) } }' "$root/Panel.qml"
+grep -Fq 'print("ready", flush=True)' "$root/bin/keylights-tray"
+grep -Fq 'commandQueue = []' "$root/Panel.qml"
+grep -Fq 'root.warningSummary !== "" ? root.warningSummary : root.stateSummary' "$root/Panel.qml"
+grep -Fq 'root.saveLightName(light, rowIndex, name)' "$root/Panel.qml"
+grep -Fq 'DragHandler {' "$root/LightControlRow.qml"
+grep -Fq 'target: null' "$root/LightControlRow.qml"
+grep -Fq 'root.moveLight(fromIndex, toIndex)' "$root/Panel.qml"
+grep -Fq 'TextField {' "$root/LightControlRow.qml"
+grep -Fq 'height: implicitHeight' "$root/LightControlRow.qml"
+grep -Fq 'text: "✎"' "$root/LightControlRow.qml"
+grep -Fq 'opened: root.opened' "$root/Panel.qml"
+if grep -Fq '"preferences", "prompt"' "$root/Panel.qml"; then
+  fail 'the plugin still delegates renaming to an external prompt'
+fi
 grep -Fq 'text: root.trayErrorText' "$root/Panel.qml"
 grep -Fq 'running: Logic.shouldPoll(root.opened, root.lights)' "$root/Panel.qml"
 grep -Fq 'property bool statusInFlight: false' "$root/Panel.qml"
@@ -219,10 +300,11 @@ grep -Fq 'system-tray drawer' "$root/README.md"
 grep -Eq 'python-dbus.*python-gobject' "$root/README.md"
 grep -Fq './bin/keylights control ACTION VALUE TARGETS_JSON' "$root/README.md"
 grep -Fq 'same-user IPC' "$root/README.md"
+grep -Fq 'screenshots/keylights-panel.png' "$root/README.md"
+grep -Fq -- \~/.config/omarchy/keylights/preferences.json "$root/README.md"
 grep -Eq 'shellcheck.*node.*ripgrep.*qmllint.*gdbus.*Omarchy installation' "$root/README.md"
 grep -Fq 'bar layout so this fallback remains reachable' "$root/README.md"
 grep -q 'connection delete uuid' "$root/bin/keylights"
-grep -Fq "serial\" == \"\$expected_id" "$root/bin/keylights"
 
 if rg -n --glob '!tests/run' '192\.168\.1\.|elgato-key-light-[0-9a-f]+\.local' "$root"; then
   fail 'private network details found in repository'
@@ -236,6 +318,7 @@ mkdir -p -- "$fake_bin"
 
 cat >"$fake_bin/avahi-browse" <<'EOF'
 #!/usr/bin/env bash
+if [[ -n "${KEYLIGHT_TEST_AVAHI_LOG:-}" ]]; then printf 'called\n' >>"$KEYLIGHT_TEST_AVAHI_LOG"; fi
 if [[ "${KEYLIGHT_TEST_AVAHI:-ok}" == fail ]]; then exit 1; fi
 if [[ "${KEYLIGHT_TEST_ESCAPED_NAME:-0}" == 1 ]]; then
   printf '=;eth0;IPv4;Elgato\\032Key\\032Light\\032T\\065ST;_elg._tcp;local;test.local;10.0.0.10;9123;"id=discovery-1"\n'
@@ -254,17 +337,23 @@ cat >"$fake_bin/curl" <<'EOF'
 set -euo pipefail
 method=GET
 payload=''
+output=''
 url=''
 while (( $# > 0 )); do
   case "$1" in
     --request) method="$2"; shift 2 ;;
     --data) payload="$2"; shift 2 ;;
+    --output) output="$2"; shift 2 ;;
     http://*) url="$1"; shift ;;
     *) shift ;;
   esac
 done
 
 [[ "$url" =~ ^http://10\.0\.0\.(1[0-9]|2[01]):9123/ || "$url" == http://192.168.62.1:9123/* ]] || exit 28
+if [[ -n "$output" ]]; then
+  [[ -f "$output" ]] || exit 23
+  exec >"$output"
+fi
 if [[ -n "${KEYLIGHT_TEST_CURL_DELAY:-}" ]]; then sleep "$KEYLIGHT_TEST_CURL_DELAY"; fi
 if [[ -n "${KEYLIGHT_TEST_CONCURRENCY_DIR:-}" ]]; then
   exec 9>>"$KEYLIGHT_TEST_CONCURRENCY_DIR/lock"
@@ -287,9 +376,7 @@ if [[ "$url" == http://192.168.62.1:9123/* ]]; then
 fi
 case "$url" in
   */elgato/accessory-info)
-    if [[ "${KEYLIGHT_TEST_SERIAL_MISMATCH:-0}" == 1 ]]; then
-      serial='OTHER-SERIAL'
-    elif [[ "${KEYLIGHT_TEST_MANY:-0}" == 1 ]]; then
+    if [[ "${KEYLIGHT_TEST_MANY:-0}" == 1 ]]; then
       serial="${url#http://10.0.0.}"
       serial="SERIAL-${serial%%:*}"
     else
@@ -375,8 +462,10 @@ cat >"$fake_bin/zenity" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 list=false
+entry=false
 for argument in "$@"; do
   if [[ "$argument" == --list ]]; then list=true; fi
+  if [[ "$argument" == --entry ]]; then entry=true; fi
   if [[ "$argument" == --question ]]; then
     printf 'http-confirmation\n' >>"$KEYLIGHT_TEST_SETUP_LOG"
     [[ "${KEYLIGHT_TEST_CONFIRM:-allow}" != deny ]] || exit 1
@@ -387,6 +476,9 @@ for argument in "$@"; do
     while true; do sleep 0.1; done
   fi
 done
+if [[ "$entry" == true ]]; then
+  printf '%s\n' "${KEYLIGHT_TEST_RENAME:-Renamed Light}"
+fi
 if [[ "$list" == true ]]; then
   mapfile -t cells
   if [[ "${KEYLIGHT_TEST_ZENITY_VALIDATE:-0}" == 1 ]]; then
@@ -438,6 +530,101 @@ many_status_json="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT
 assert_jq "$many_status_json" '.lights | length == 12' 'parallel discovery dropped or duplicated a light result'
 assert_jq "$many_status_json" '[.lights[].id] | unique | length == 12' 'parallel discovery returned duplicate light ids'
 
+preferences_file="$work_dir/preferences.json"
+KEYLIGHTS_PREFERENCES_FILE="$preferences_file" \
+  "$root/bin/keylights" preferences set SERIAL-11 discovery-11 0 Links
+KEYLIGHTS_PREFERENCES_FILE="$preferences_file" \
+  "$root/bin/keylights" preferences set SERIAL-10 discovery-10 1 Rechts
+preferred_status_json="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_MANY=1 \
+  KEYLIGHTS_PREFERENCES_FILE="$preferences_file" "$root/bin/keylights" json)"
+assert_jq "$preferred_status_json" \
+  '.lights[0].id == "SERIAL-11" and .lights[0].name == "Links" and .lights[0].originalName == "Elgato Key Light 11" and .lights[0].preferenceOrder == 0' \
+  'first configured light did not receive its alias and position'
+assert_jq "$preferred_status_json" \
+  '.lights[1].id == "SERIAL-10" and .lights[1].name == "Rechts" and .lights[1].originalName == "Elgato Key Light 10" and .lights[1].preferenceOrder == 1' \
+  'second configured light did not receive its alias and position'
+[[ "$(stat -c '%a' "$preferences_file")" == 600 ]] || fail 'preferences file permissions are not private'
+
+preferred_human_status="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_MANY=1 \
+  KEYLIGHTS_PREFERENCES_FILE="$preferences_file" "$root/bin/keylights" Links status)"
+grep -Fq 'Links:' <<<"$preferred_human_status" || fail 'an alias was not accepted or displayed by the human-readable CLI'
+
+set +e
+KEYLIGHTS_PREFERENCES_FILE="$preferences_file" \
+  "$root/bin/keylights" preferences set SERIAL-BAD discovery-bad 18446744073709551616 Overflow >/dev/null 2>&1
+overflow_status=$?
+KEYLIGHTS_PREFERENCES_FILE="$preferences_file" \
+  "$root/bin/keylights" preferences set SERIAL-BAD discovery-bad 2 '   ' >/dev/null 2>&1
+blank_name_status=$?
+set -e
+[[ "$overflow_status" == 2 ]] || fail 'an overflowing preference position was accepted'
+[[ "$blank_name_status" == 2 ]] || fail 'a whitespace-only preference name was accepted'
+assert_jq "$(<"$preferences_file")" '.lights | length == 2' 'invalid preference input changed saved preferences'
+
+KEYLIGHTS_PREFERENCES_FILE="$preferences_file" \
+  "$root/bin/keylights" preferences set SERIAL-11 discovery-11 0 'Links "Studio"'
+quoted_status_json="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_MANY=1 \
+  KEYLIGHTS_PREFERENCES_FILE="$preferences_file" "$root/bin/keylights" json)"
+assert_jq "$quoted_status_json" '.lights[0].name == "Links \"Studio\""' \
+  'a valid alias containing spaces and JSON metacharacters was corrupted'
+
+KEYLIGHTS_PREFERENCES_FILE="$preferences_file" \
+  "$root/bin/keylights" preferences clear SERIAL-11
+cleared_status_json="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_MANY=1 \
+  KEYLIGHTS_PREFERENCES_FILE="$preferences_file" "$root/bin/keylights" json)"
+assert_jq "$cleared_status_json" \
+  '.lights[0].id == "SERIAL-10" and .lights[0].name == "Rechts" and ([.lights[].id] | index("SERIAL-11")) != null' \
+  'clearing a preference did not restore the discovered name and default order'
+
+corrupt_preferences_file="$work_dir/corrupt-preferences.json"
+printf '%s\n' '{"version":2,"lights":{}}' >"$corrupt_preferences_file"
+corrupt_preferences_status="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" \
+  KEYLIGHTS_PREFERENCES_FILE="$corrupt_preferences_file" "$root/bin/keylights" json)"
+assert_jq "$corrupt_preferences_status" \
+  '.error == null and .lights[0].name == "Elgato Key Light TEST"' \
+  'an unsupported preferences version broke discovery instead of falling back to defaults'
+
+symlink_target="$work_dir/symlink-target.json"
+symlink_preferences="$work_dir/symlink-preferences.json"
+printf '%s\n' '{"version":1,"lights":{}}' >"$symlink_target"
+ln -s "$symlink_target" "$symlink_preferences"
+KEYLIGHTS_PREFERENCES_FILE="$symlink_preferences" \
+  "$root/bin/keylights" preferences set SERIAL-LINK discovery-link 0 Linked
+[[ -L "$symlink_preferences" ]] || fail 'saving preferences replaced a preferences symlink'
+jq -e '.lights["SERIAL-LINK"].name == "Linked"' "$symlink_target" >/dev/null || \
+  fail 'saving through a preferences symlink did not update its target'
+
+race_preferences="$work_dir/race-preferences.json"
+preference_pids=()
+for number in {0..7}; do
+  KEYLIGHTS_PREFERENCES_FILE="$race_preferences" \
+    "$root/bin/keylights" preferences set "SERIAL-RACE-$number" "discovery-race-$number" "$number" "Race $number" &
+  preference_pids+=("$!")
+done
+for preference_pid in "${preference_pids[@]}"; do wait "$preference_pid"; done
+jq -e '.lights | length == 8' "$race_preferences" >/dev/null || \
+  fail 'concurrent preference writers lost successful updates'
+
+inventory_preferences="$work_dir/inventory-preferences.json"
+KEYLIGHTS_PREFERENCES_FILE="$inventory_preferences" \
+  "$root/bin/keylights" preferences set SERIAL-1 discovery-1 0 Present
+KEYLIGHTS_PREFERENCES_FILE="$inventory_preferences" \
+  "$root/bin/keylights" preferences set SERIAL-MISSING discovery-missing 1 Missing
+inventory_status="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" \
+  KEYLIGHTS_PREFERENCES_FILE="$inventory_preferences" "$root/bin/keylights" json)"
+assert_jq "$inventory_status" \
+  '.lights | length == 2 and .[0].id == "SERIAL-1" and .[0].reachable == true and .[1].id == "SERIAL-MISSING" and .[1].name == "Missing" and .[1].reachable == false' \
+  'a configured light disappeared when absent from one discovery snapshot'
+PATH="$test_path" KEYLIGHT_TEST_RENAME='Left Desk' KEYLIGHTS_PREFERENCES_FILE="$inventory_preferences" \
+  "$root/bin/keylights" preferences prompt SERIAL-1 discovery-1 0 Present
+jq -e '.lights["SERIAL-1"].name == "Left Desk"' "$inventory_preferences" >/dev/null || \
+  fail 'the user-facing rename prompt did not save the entered alias'
+ordered_preferences='[{"id":"SERIAL-MISSING","discoveryId":"discovery-missing","name":"Missing"},{"id":"SERIAL-1","discoveryId":"discovery-1","name":"Left Desk"}]'
+KEYLIGHTS_PREFERENCES_FILE="$inventory_preferences" \
+  "$root/bin/keylights" preferences order "$ordered_preferences"
+jq -e '.lights["SERIAL-MISSING"].order == 0 and .lights["SERIAL-1"].order == 1' \
+  "$inventory_preferences" >/dev/null || fail 'the user-facing reorder action did not persist the requested order'
+
 runtime_tmp="$work_dir/runtime-tmp"
 mkdir -p "$runtime_tmp"
 setsid env PATH="$test_path" TMPDIR="$runtime_tmp" KEYLIGHT_TEST_STATE="$state_file" \
@@ -456,11 +643,11 @@ wait "$runtime_pid"
 set -e
 runtime_pid=""
 for _ in {1..100}; do
-  [[ -z "$(find "$runtime_tmp" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]] && break
+  [[ -z "$(find "$runtime_tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]] && break
   sleep 0.02
 done
-[[ -z "$(find "$runtime_tmp" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]] || \
-  fail 'interrupted status call leaked its temporary directory'
+[[ -z "$(find "$runtime_tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]] || \
+  fail 'interrupted status call leaked temporary artifacts'
 
 set +e
 discovery_error="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_AVAHI=fail \
@@ -503,18 +690,18 @@ set -e
 jq -e '.brightness == 55' "$state_file" >/dev/null || fail 'invalid brightness changed device state'
 
 stale_targets='[{"id":"SERIAL-1","discoveryId":"discovery-1","name":"Test Light","address":"10.0.0.99","port":9123}]'
-recovered_result="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" \
-  "$root/bin/keylights" control status - "$stale_targets")"
-assert_jq "$recovered_result" '.failures == 0 and .results[0].address == "10.0.0.10"' 'stale address was not recovered through mDNS'
-
+control_avahi_log="$work_dir/control-avahi-log"
+: >"$control_avahi_log"
 set +e
-mismatch_result="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_SERIAL_MISMATCH=1 \
+stale_result="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" \
+  KEYLIGHT_TEST_AVAHI_LOG="$control_avahi_log" \
   "$root/bin/keylights" control status - "$stale_targets")"
-mismatch_status=$?
+stale_status=$?
 set -e
-[[ "$mismatch_status" == 1 ]] || fail 'mismatched rediscovered serial was accepted'
-assert_jq "$mismatch_result" '.failures == 1 and .results[0].ok == false' \
-  'mismatched rediscovered serial did not produce a device failure'
+[[ "$stale_status" == 1 ]] || fail 'stale address did not return a bounded device failure'
+assert_jq "$stale_result" '.failures == 1 and .results[0].ok == false' \
+  'stale address did not produce a structured device failure'
+[[ ! -s "$control_avahi_log" ]] || fail 'control failure synchronously entered mDNS discovery'
 
 partial_targets='[{"id":"SERIAL-1","discoveryId":"discovery-1","name":"First","address":"10.0.0.10","port":9123},{"id":"SERIAL-2","discoveryId":"missing","name":"Second","address":"10.0.0.98","port":9123}]'
 set +e

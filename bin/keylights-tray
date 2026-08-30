@@ -28,7 +28,12 @@ PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
 WATCHER_NAME = "org.kde.StatusNotifierWatcher"
 WATCHER_PATH = "/StatusNotifierWatcher"
 WATCHER_INTERFACE = "org.kde.StatusNotifierWatcher"
-WATCHER_MAX_ATTEMPTS = 15
+WATCHER_MAX_ATTEMPTS = 3
+WATCHER_RETRY_SECONDS = 1
+WATCHER_LOSS_GRACE_MS = 1000
+REGISTRATION_SUCCESS = "success"
+REGISTRATION_RETRY = "retry"
+REGISTRATION_EXHAUSTED = "exhausted"
 IPC_TARGET = "io.github.milofax.keylights"
 ICON_DIR = Path(__file__).resolve().parent.parent / "icons"
 
@@ -169,24 +174,36 @@ def wait_for_name(
     elif claim_name(bus):
         acquired["value"] = True
     else:
+        def stop_if_requested() -> bool:
+            if lifecycle["stopping"]:
+                loop.quit()
+            return False
+
+        GLib.idle_add(stop_if_requested)
         loop.run()
     lifecycle["loop"] = None
     match.remove()
     return acquired["value"] and not lifecycle["stopping"]
 
 
-def register_with_watcher(bus: dbus.SessionBus, state: dict[str, int]) -> bool:
+def register_with_watcher(
+    bus: dbus.SessionBus,
+    state: dict[str, int],
+    max_attempts: int = WATCHER_MAX_ATTEMPTS,
+) -> str:
     state["attempts"] += 1
     try:
         watcher = bus.get_object(WATCHER_NAME, WATCHER_PATH)
         watcher.RegisterStatusNotifierItem(
             BUS_NAME,
             dbus_interface=WATCHER_INTERFACE,
-            timeout=2,
+            timeout=1,
         )
-        return False
+        return REGISTRATION_SUCCESS
     except dbus.DBusException:
-        return state["attempts"] < WATCHER_MAX_ATTEMPTS
+        if state["attempts"] < max_attempts:
+            return REGISTRATION_RETRY
+        return REGISTRATION_EXHAUSTED
 
 
 def main() -> int:
@@ -202,7 +219,7 @@ def main() -> int:
 
         retry_state = {"attempts": 0}
         decisions = [
-            register_with_watcher(MissingWatcherBus(), retry_state)
+            register_with_watcher(MissingWatcherBus(), retry_state) == REGISTRATION_RETRY
             for _ in range(WATCHER_MAX_ATTEMPTS)
         ]
         print(json.dumps({"attempts": retry_state["attempts"], "decisions": decisions}))
@@ -214,7 +231,7 @@ def main() -> int:
     except dbus.DBusException:
         return 5
 
-    lifecycle: dict[str, object] = {"loop": None, "stopping": False}
+    lifecycle: dict[str, object] = {"loop": None, "stopping": False, "exitCode": 0}
     def stop(*_args: object) -> None:
         lifecycle["stopping"] = True
         active_loop = lifecycle["loop"]
@@ -229,24 +246,140 @@ def main() -> int:
     loop = GLib.MainLoop()
     lifecycle["loop"] = loop
 
+    def stop_if_requested() -> bool:
+        if lifecycle["stopping"]:
+            loop.quit()
+        return False
+
+    GLib.idle_add(stop_if_requested)
+
     ready_path = os.environ.get("KEYLIGHTS_TRAY_READY", "")
     if ready_path:
         Path(ready_path).touch()
 
     item = None
+    watcher_match = None
+    watcher_retry = {"source": 0}
     if test_mode != "hold":
         item = StatusNotifierItem(bus)
         if test_mode != "object":
             watcher_state = {"attempts": 0}
-            if register_with_watcher(bus, watcher_state):
-                GLib.timeout_add_seconds(2, register_with_watcher, bus, watcher_state)
+            fast_retry = test_mode == "fast-watcher-retry"
+            max_attempts = WATCHER_MAX_ATTEMPTS
+
+            def cancel_watcher_registration() -> None:
+                retry_source = watcher_retry["source"]
+                if retry_source:
+                    GLib.source_remove(retry_source)
+                    watcher_retry["source"] = 0
+
+            def schedule_watcher_retry() -> None:
+                if lifecycle["stopping"]:
+                    return
+                if fast_retry:
+                    watcher_retry["source"] = GLib.timeout_add(
+                        10,
+                        retry_watcher_registration,
+                    )
+                else:
+                    watcher_retry["source"] = GLib.timeout_add_seconds(
+                        WATCHER_RETRY_SECONDS,
+                        retry_watcher_registration,
+                    )
+
+            def stop_after_registration_failure() -> bool:
+                watcher_retry["source"] = 0
+                if lifecycle["stopping"]:
+                    return False
+                lifecycle["exitCode"] = 4
+                active_loop = lifecycle["loop"]
+                if active_loop is not None:
+                    active_loop.quit()
+                return False
+
+            def attempt_watcher_registration() -> None:
+                if lifecycle["stopping"]:
+                    return
+                result = register_with_watcher(bus, watcher_state, max_attempts)
+                if lifecycle["stopping"]:
+                    return
+                if result == REGISTRATION_RETRY:
+                    schedule_watcher_retry()
+                elif result == REGISTRATION_EXHAUSTED:
+                    stop_after_registration_failure()
+                else:
+                    print("ready", flush=True)
+
+            def retry_watcher_registration() -> bool:
+                watcher_retry["source"] = 0
+                attempt_watcher_registration()
+                return False
+
+            def start_watcher_registration() -> bool:
+                if lifecycle["stopping"]:
+                    return False
+                cancel_watcher_registration()
+                watcher_state["attempts"] = 0
+                attempt_watcher_registration()
+                return False
+
+            def initial_watcher_registration() -> bool:
+                if watcher_retry["source"]:
+                    watcher_retry["source"] = 0
+                if lifecycle["stopping"]:
+                    return False
+                try:
+                    owner_available = bus.name_has_owner(WATCHER_NAME)
+                except dbus.DBusException:
+                    owner_available = False
+                if owner_available:
+                    start_watcher_registration()
+                else:
+                    schedule_watcher_loss()
+                return False
+
+            def schedule_watcher_loss() -> None:
+                if lifecycle["stopping"]:
+                    return
+                cancel_watcher_registration()
+                watcher_retry["source"] = GLib.timeout_add(
+                    20 if fast_retry else WATCHER_LOSS_GRACE_MS,
+                    stop_after_registration_failure,
+                )
+
+            def watcher_owner_changed(
+                _name: str,
+                _old_owner: str,
+                new_owner: str,
+            ) -> None:
+                if lifecycle["stopping"]:
+                    return
+                if new_owner:
+                    start_watcher_registration()
+                else:
+                    schedule_watcher_loss()
+
+            watcher_match = bus.add_signal_receiver(
+                watcher_owner_changed,
+                signal_name="NameOwnerChanged",
+                dbus_interface="org.freedesktop.DBus",
+                bus_name="org.freedesktop.DBus",
+                path="/org/freedesktop/DBus",
+                arg0=WATCHER_NAME,
+            )
+            watcher_retry["source"] = GLib.idle_add(initial_watcher_registration)
 
     loop.run()
     lifecycle["loop"] = None
+    retry_source = watcher_retry["source"]
+    if retry_source:
+        GLib.source_remove(retry_source)
+    if watcher_match is not None:
+        watcher_match.remove()
     if item is not None:
         item.remove_from_connection()
     bus.release_name(BUS_NAME)
-    return 0
+    return int(lifecycle["exitCode"])
 
 
 if __name__ == "__main__":

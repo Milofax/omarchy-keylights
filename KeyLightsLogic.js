@@ -11,7 +11,13 @@ function barVisible(lights) {
 }
 
 function trayWanted(lights) {
-  return !barVisible(lights)
+  var values = asLights(lights)
+  if (values.length === 0) return false
+
+  for (var i = 0; i < values.length; i++) {
+    if (values[i].reachable !== true || Number(values[i].on) === 1) return false
+  }
+  return true
 }
 
 function advanceTrayMode(currentMode, requestedMode, confirmations) {
@@ -39,6 +45,15 @@ function connectionLost(lights) {
     if (values[i].reachable === true) return false
   }
   return true
+}
+
+function iconCrossed(lights, errorText, statusInFlight) {
+  if (String(errorText || "") !== "" || connectionLost(lights)) return true
+  return asLights(lights).length === 0 && statusInFlight !== true
+}
+
+function setupVisible(setupAvailable) {
+  return setupAvailable === true
 }
 
 function shouldPoll(opened, lights) {
@@ -92,6 +107,21 @@ function dequeueCommand(commands) {
   }
 }
 
+function moveLight(lights, fromIndex, toIndex) {
+  var values = asLights(lights).slice()
+  var from = Math.round(Number(fromIndex))
+  var to = Math.round(Number(toIndex))
+  if (!isFinite(from) || !isFinite(to) || from < 0 || from >= values.length
+      || to < 0 || to >= values.length || from === to) return values
+  var moving = values.splice(from, 1)[0]
+  values.splice(to, 0, moving)
+  return values
+}
+
+function normalizedLightName(name) {
+  return String(name || "").trim().slice(0, 64)
+}
+
 function operationBusy(statusInFlight, actionRunning, setupRunning, queueLength, activeCommand) {
   return statusInFlight === true || actionRunning === true || setupRunning === true
     || Number(queueLength) > 0 || activeCommand !== null && activeCommand !== false
@@ -122,19 +152,42 @@ function reconcileLights(previousLights, nextLights) {
   var previous = asLights(previousLights)
   var next = asLights(nextLights)
   var result = []
+  var matchedPrevious = []
 
   for (var i = 0; i < next.length; i++) {
     var light = copyObject(next[i])
-    if (light.reachable !== true) {
-      for (var j = 0; j < previous.length; j++) {
-        if (!sameIdentity(previous[j], light)) continue
+    for (var j = 0; j < previous.length; j++) {
+      if (!sameIdentity(previous[j], light)) continue
+      matchedPrevious[j] = true
+      if (light.reachable !== true) {
         light.id = previous[j].id
         if (!light.discoveryId) light.discoveryId = previous[j].discoveryId || previous[j].id
-        break
+        if (previous[j].name) light.name = previous[j].name
+        if (previous[j].originalName) light.originalName = previous[j].originalName
+        if (Number(previous[j].preferenceOrder) >= 0)
+          light.preferenceOrder = Number(previous[j].preferenceOrder)
       }
+      break
     }
     result.push(light)
   }
+
+  for (var k = 0; k < previous.length; k++) {
+    if (matchedPrevious[k] === true) continue
+    var missing = copyObject(previous[k])
+    missing.reachable = false
+    result.push(missing)
+  }
+  result.sort(function(left, right) {
+    var leftOrder = Number(left.preferenceOrder)
+    var rightOrder = Number(right.preferenceOrder)
+    if (!isFinite(leftOrder)) leftOrder = 10000
+    if (!isFinite(rightOrder)) rightOrder = 10000
+    if (leftOrder !== rightOrder) return leftOrder - rightOrder
+    var leftName = String(left.name || left.id || "")
+    var rightName = String(right.name || right.id || "")
+    return leftName < rightName ? -1 : leftName > rightName ? 1 : 0
+  })
   return result
 }
 
@@ -175,11 +228,15 @@ if (typeof module !== "undefined") {
     advanceTrayMode: advanceTrayMode,
     trayExitAction: trayExitAction,
     connectionLost: connectionLost,
+    iconCrossed: iconCrossed,
+    setupVisible: setupVisible,
     shouldPoll: shouldPoll,
     brightnessSummary: brightnessSummary,
     temperatureSummary: temperatureSummary,
     enqueueCommand: enqueueCommand,
     dequeueCommand: dequeueCommand,
+    moveLight: moveLight,
+    normalizedLightName: normalizedLightName,
     operationBusy: operationBusy,
     operationReady: operationReady,
     reconcileLights: reconcileLights,

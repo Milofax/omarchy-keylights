@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.milofax.keylights",
   "name": "Key Lights",
-  "version": "1.1.0",
+  "version": "1.4.2",
   "author": "Milofax",
   "license": "MIT",
   "description": "Discover, control, and set up Elgato Key Lights from the Omarchy bar and tray drawer.",
@@ -15,7 +15,7 @@
   },
   "barWidget": {
     "displayName": "Key Lights",
-    "description": "Automatic discovery, individual switches, shared brightness and temperature controls, and Wi-Fi setup.",
+    "description": "Automatic discovery, draggable and inline-renamable light controls, shared brightness and temperature controls, and Wi-Fi setup.",
     "category": "System",
     "defaultSection": "right",
     "aliases": [
