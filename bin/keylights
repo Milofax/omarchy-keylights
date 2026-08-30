@@ -62,7 +62,7 @@ decode_avahi() {
 }
 
 valid_ipv4() {
-  local address="$1" octet
+  local address="$1" octet first second
   local -a octets
 
   [[ "$address" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1
@@ -70,6 +70,16 @@ valid_ipv4() {
   for octet in "${octets[@]}"; do
     [[ "$octet" =~ ^[0-9]+$ ]] && (( 10#$octet <= 255 )) || return 1
   done
+
+  first=$((10#${octets[0]}))
+  second=$((10#${octets[1]}))
+  case "$first" in
+    10) return 0 ;;
+    172) (( second >= 16 && second <= 31 )) ;;
+    192) (( second == 168 )) ;;
+    169) (( second == 254 )) ;;
+    *) return 1 ;;
+  esac
 }
 
 valid_port() {
@@ -111,13 +121,10 @@ preferences_write_path() {
     return 2
   fi
   if [[ -L "$PREFERENCES_FILE" ]]; then
-    realpath -- "$PREFERENCES_FILE" || {
-      printf 'The Key Lights preferences symlink has no valid target.\n' >&2
-      return 2
-    }
-  else
-    printf '%s\n' "$PREFERENCES_FILE"
+    printf 'Refusing to write Key Lights preferences through a symlink: %s\n' "$PREFERENCES_FILE" >&2
+    return 2
   fi
+  printf '%s\n' "$PREFERENCES_FILE"
 }
 
 save_preference() (

@@ -2,7 +2,7 @@
 
 An Omarchy bar plugin that automatically discovers and controls Elgato Key Lights on the local network.
 
-![Key Lights panel with two named and reorderable lights](screenshots/keylights-panel.png)
+![Key Lights panel with two named and reorderable lights](preview.png)
 
 ## Quick start
 
@@ -30,6 +30,7 @@ Once discovery completes, left-click the Key Lights icon to open the panel. Use 
 - Python 3 with `python-dbus` and `python-gobject` for the system-tray item
 - The `omarchy.tray` widget present in the bar layout for the automatic tray fallback
 - NetworkManager, Zenity, a Wi-Fi adapter, and a browser for first-time setup
+- Optional `notify-send` (from libnotify) for the setup-complete desktop notification
 - Key Lights and the Omarchy computer on the same local network
 
 The control panel works without Elgato Control Center. First-time setup additionally requires `nmcli`, `zenity`, `xdg-open`, and a Wi-Fi adapter.
@@ -118,7 +119,7 @@ Configured lights form a persistent local inventory. If one is absent from a sin
 
 ## Privacy and security
 
-The plugin communicates only with Avahi, NetworkManager, and discovered Elgato lights on the local network. Discovery marks an endpoint reachable only after verifying the Elgato accessory API; unreachable advertisements may still appear as disabled panel rows. After a bounded command failure, the normal background refresh re-discovers and verifies changed endpoints before a later command uses them. The plugin does not contact a cloud service or store Wi-Fi credentials. Its optional preferences file contains only stable device IDs, aliases, and sort positions.
+The plugin communicates only with Avahi, NetworkManager, and discovered Elgato lights on the local network. It accepts only private RFC 1918 or IPv4 link-local addresses from mDNS, then marks an endpoint reachable only after verifying the Elgato accessory API; unreachable advertisements may still appear as disabled panel rows. After a bounded command failure, the normal background refresh re-discovers and verifies changed endpoints before a later command uses them. The plugin does not contact a cloud service or store Wi-Fi credentials. Its optional preferences file contains only stable device IDs, aliases, and sort positions, and the driver refuses to write through a symlinked preferences path.
 
 The tray helper owns one fixed name on the local session D-Bus, so multiple monitor instances cannot publish duplicate icons. Other monitor instances wait without respawning and take ownership if the active monitor disappears. The helper re-registers its existing item if the system-tray watcher restarts. It is started only while the standalone bar icon is hidden, unregisters on termination, and talks back to the existing panel through Omarchy's same-user IPC. Like every Omarchy IPC target, its setup and control methods are available to other processes running as the same user; this does not cross the operating system's user boundary. Background discovery polling runs only while the panel is open or at least one previously discovered light remains known.
 
@@ -148,13 +149,11 @@ Validate the repository with:
 
 Development checks require `shellcheck`, `node`, `ripgrep`, `qmllint`, `qmltestrunner` (from Qt Declarative), `gdbus` (from GLib), `dbus-run-session`, and an Omarchy installation with its plugin validator. The suite replaces Avahi, curl, NetworkManager, Zenity, browser, and notification commands with temporary fixtures; it never contacts a real light or changes the host network. Qt Quick tests render the shipped light-row component offscreen and perform real mouse drag and rename-button interactions while asserting that neither path emits a light-toggle request. Tray ownership, restart, and SIGTERM lifecycle tests run on an isolated session D-Bus when one can be created. Set `KEYLIGHTS_TEST_REQUIRE_DBUS=1` to fail instead of skipping when that isolated bus is unavailable.
 
-Agent skills are vendored on the `main` development branch under
-`.agents/skills`, mirrored into Claude through tracked `.claude/skills`
-symlinks, and locked by `skills-lock.json`. Run `bin/update-skills` to update
-them or `bin/update-skills --check` to verify them. The public `plugin` branch
-is the default and contains only the installable plugin payload because
-Omarchy plugins may not contain symlinks. Release tags are cut exclusively
-from that skill-free branch.
+Repository-maintenance agent skills and `bin/update-skills` live only on the
+`main` development branch. They are intentionally absent from the default
+`plugin` branch, which contains only the installable payload because Omarchy
+plugins may not contain symlinks. Release tags are cut exclusively from that
+skill-free branch.
 
 ## License
 

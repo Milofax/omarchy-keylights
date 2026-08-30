@@ -27,15 +27,15 @@ assert_jq() {
   jq -e "$expression" <<<"$json" >/dev/null || fail "$message"
 }
 
-for required_command in shellcheck node rg qmllint gdbus dbus-run-session flock realpath; do
+for required_command in shellcheck node rg qmllint gdbus dbus-run-session flock; do
   command -v "$required_command" >/dev/null || fail "required development command is missing: $required_command"
 done
 
 payload_dir="$work_dir/plugin-payload"
-mkdir -p "$payload_dir/bin" "$payload_dir/icons" "$payload_dir/screenshots"
+mkdir -p "$payload_dir/bin" "$payload_dir/icons"
 for release_file in LICENSE README.md Panel.qml LightControlRow.qml KeyLightsLogic.js manifest.json \
     bin/keylights bin/keylights-tray icons/io.github.milofax.keylights-symbolic.svg \
-    screenshots/keylights-panel.png; do
+    preview.png; do
   [[ -f "$root/$release_file" && ! -L "$root/$release_file" ]] || \
     fail "release payload file is missing or a symlink: $release_file"
 done
@@ -43,7 +43,7 @@ cp "$root/LICENSE" "$root/README.md" "$root/Panel.qml" "$root/LightControlRow.qm
   "$root/manifest.json" "$payload_dir/"
 cp "$root/bin/keylights" "$root/bin/keylights-tray" "$payload_dir/bin/"
 cp "$root/icons/io.github.milofax.keylights-symbolic.svg" "$payload_dir/icons/"
-cp "$root/screenshots/keylights-panel.png" "$payload_dir/screenshots/"
+cp "$root/preview.png" "$payload_dir/"
 
 bash -n "$root/bin/keylights"
 shellcheck "$root/bin/keylights"
@@ -253,7 +253,7 @@ fi
 [[ -z "$(find "$payload_dir" -type l -print -quit)" ]] || fail 'release payload contains a symlink'
 
 grep -q '"id": "io.github.milofax.keylights"' "$root/manifest.json"
-grep -q '"version": "1.4.2"' "$root/manifest.json"
+grep -q '"version": "1.4.3"' "$root/manifest.json"
 grep -q 'moduleName: "io.github.milofax.keylights"' "$root/Panel.qml"
 grep -q 'ipcTarget: "io.github.milofax.keylights"' "$root/Panel.qml"
 grep -Fq 'import "KeyLightsLogic.js" as Logic' "$root/Panel.qml"
@@ -275,6 +275,7 @@ grep -Fq 'root.moveLight(fromIndex, toIndex)' "$root/Panel.qml"
 grep -Fq 'TextField {' "$root/LightControlRow.qml"
 grep -Fq 'height: implicitHeight' "$root/LightControlRow.qml"
 grep -Fq 'text: "✎"' "$root/LightControlRow.qml"
+grep -Fq 'property color switchOnColor: "#4ade80"' "$root/LightControlRow.qml"
 grep -Fq 'opened: root.opened' "$root/Panel.qml"
 if grep -Fq '"preferences", "prompt"' "$root/Panel.qml"; then
   fail 'the plugin still delegates renaming to an external prompt'
@@ -300,7 +301,9 @@ grep -Fq 'system-tray drawer' "$root/README.md"
 grep -Eq 'python-dbus.*python-gobject' "$root/README.md"
 grep -Fq './bin/keylights control ACTION VALUE TARGETS_JSON' "$root/README.md"
 grep -Fq 'same-user IPC' "$root/README.md"
-grep -Fq 'screenshots/keylights-panel.png' "$root/README.md"
+grep -Fq '](preview.png)' "$root/README.md"
+grep -Fq 'notify-send' "$root/README.md"
+grep -Fq 'private RFC 1918 or IPv4 link-local addresses' "$root/README.md"
 grep -Fq -- \~/.config/omarchy/keylights/preferences.json "$root/README.md"
 grep -Eq 'shellcheck.*node.*ripgrep.*qmllint.*gdbus.*Omarchy installation' "$root/README.md"
 grep -Fq 'bar layout so this fallback remains reachable' "$root/README.md"
@@ -588,11 +591,15 @@ symlink_target="$work_dir/symlink-target.json"
 symlink_preferences="$work_dir/symlink-preferences.json"
 printf '%s\n' '{"version":1,"lights":{}}' >"$symlink_target"
 ln -s "$symlink_target" "$symlink_preferences"
+set +e
 KEYLIGHTS_PREFERENCES_FILE="$symlink_preferences" \
-  "$root/bin/keylights" preferences set SERIAL-LINK discovery-link 0 Linked
-[[ -L "$symlink_preferences" ]] || fail 'saving preferences replaced a preferences symlink'
-jq -e '.lights["SERIAL-LINK"].name == "Linked"' "$symlink_target" >/dev/null || \
-  fail 'saving through a preferences symlink did not update its target'
+  "$root/bin/keylights" preferences set SERIAL-LINK discovery-link 0 Linked >/dev/null 2>&1
+symlink_status=$?
+set -e
+[[ "$symlink_status" == 2 ]] || fail 'a symlinked preferences path was accepted'
+[[ -L "$symlink_preferences" ]] || fail 'rejecting preferences replaced their symlink'
+jq -e '.lights | length == 0' "$symlink_target" >/dev/null || \
+  fail 'rejecting a preferences symlink still changed its target'
 
 race_preferences="$work_dir/race-preferences.json"
 preference_pids=()
@@ -661,6 +668,17 @@ targets='[{"id":"SERIAL-1","discoveryId":"discovery-1","name":"Test Light","addr
 direct_result="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_AVAHI=fail \
   "$root/bin/keylights" control status - "$targets")"
 assert_jq "$direct_result" '.failures == 0 and .results[0].ok == true' 'direct control unnecessarily depended on mDNS'
+
+for unsafe_address in 8.8.8.8 127.0.0.1 0.0.0.0; do
+  unsafe_targets="$(jq -cn --arg address "$unsafe_address" \
+    '[{id:"SERIAL-UNSAFE",discoveryId:"discovery-unsafe",name:"Unsafe",address:$address,port:9123}]')"
+  set +e
+  PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" \
+    "$root/bin/keylights" control status - "$unsafe_targets" >/dev/null 2>&1
+  unsafe_status=$?
+  set -e
+  [[ "$unsafe_status" == 2 ]] || fail "unsafe control address was accepted: $unsafe_address"
+done
 
 missing_temperature="$(PATH="$test_path" KEYLIGHT_TEST_STATE="$state_file" KEYLIGHT_TEST_OMIT_TEMPERATURE=1 \
   "$root/bin/keylights" all status)"

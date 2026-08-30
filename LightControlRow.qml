@@ -14,6 +14,7 @@ Item {
   property bool actionBusy: false
   property color foreground: "white"
   property color accent: "#ff6b6b"
+  property color switchOnColor: "#4ade80"
   property color dim: Qt.darker(foreground, 1.55)
   property string fontFamily: "sans-serif"
   property real rowHeight: 38
@@ -240,11 +241,12 @@ Item {
 
     Rectangle {
       id: toggleTrack
+      objectName: "toggleTrack"
       width: lightSwitch.trackWidth
       height: lightSwitch.trackHeight
       anchors.centerIn: parent
       radius: height / 2
-      color: lightSwitch.checked ? root.accent : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.16)
+      color: lightSwitch.checked ? root.switchOnColor : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.16)
       border.width: 1
       border.color: root.dim
 
