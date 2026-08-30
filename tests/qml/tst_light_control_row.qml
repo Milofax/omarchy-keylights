@@ -71,5 +71,19 @@ Item {
       compare(nameEditor.text, "Links")
       compare(toggleSpy.count, 0)
     }
+
+    function test_enabled_light_uses_green_switch_track() {
+      var row = createTemporaryObject(rowComponent, testSurface, {
+        x: 20,
+        y: 20,
+        light: ({id: "SERIAL-1", name: "Links", reachable: true, on: 1})
+      })
+      verify(row !== null)
+      waitForRendering(row)
+
+      var track = findChild(row, "toggleTrack")
+      verify(track !== null)
+      compare(track.color.toString().toLowerCase(), "#4ade80")
+    }
   }
 }

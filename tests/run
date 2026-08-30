@@ -275,6 +275,7 @@ grep -Fq 'root.moveLight(fromIndex, toIndex)' "$root/Panel.qml"
 grep -Fq 'TextField {' "$root/LightControlRow.qml"
 grep -Fq 'height: implicitHeight' "$root/LightControlRow.qml"
 grep -Fq 'text: "✎"' "$root/LightControlRow.qml"
+grep -Fq 'property color switchOnColor: "#4ade80"' "$root/LightControlRow.qml"
 grep -Fq 'opened: root.opened' "$root/Panel.qml"
 if grep -Fq '"preferences", "prompt"' "$root/Panel.qml"; then
   fail 'the plugin still delegates renaming to an external prompt'
