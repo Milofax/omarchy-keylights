@@ -253,7 +253,7 @@ fi
 [[ -z "$(find "$payload_dir" -type l -print -quit)" ]] || fail 'release payload contains a symlink'
 
 grep -q '"id": "io.github.milofax.keylights"' "$root/manifest.json"
-grep -q '"version": "1.4.3"' "$root/manifest.json"
+grep -q '"version": "1.4.4"' "$root/manifest.json"
 grep -q 'moduleName: "io.github.milofax.keylights"' "$root/Panel.qml"
 grep -q 'ipcTarget: "io.github.milofax.keylights"' "$root/Panel.qml"
 grep -Fq 'import "KeyLightsLogic.js" as Logic' "$root/Panel.qml"
@@ -304,6 +304,7 @@ grep -Fq 'same-user IPC' "$root/README.md"
 grep -Fq '](preview.png)' "$root/README.md"
 grep -Fq 'notify-send' "$root/README.md"
 grep -Fq 'private RFC 1918 or IPv4 link-local addresses' "$root/README.md"
+grep -Fq 'limits every device response to 64 KiB' "$root/README.md"
 grep -Fq -- \~/.config/omarchy/keylights/preferences.json "$root/README.md"
 grep -Eq 'shellcheck.*node.*ripgrep.*qmllint.*gdbus.*Omarchy installation' "$root/README.md"
 grep -Fq 'bar layout so this fallback remains reachable' "$root/README.md"
@@ -341,17 +342,20 @@ set -euo pipefail
 method=GET
 payload=''
 output=''
+max_filesize=unset
 url=''
 while (( $# > 0 )); do
   case "$1" in
     --request) method="$2"; shift 2 ;;
     --data) payload="$2"; shift 2 ;;
+    --max-filesize) max_filesize="$2"; shift 2 ;;
     --output) output="$2"; shift 2 ;;
     http://*) url="$1"; shift ;;
     *) shift ;;
   esac
 done
 
+[[ "$max_filesize" == 65536 ]] || exit 63
 [[ "$url" =~ ^http://10\.0\.0\.(1[0-9]|2[01]):9123/ || "$url" == http://192.168.62.1:9123/* ]] || exit 28
 if [[ -n "$output" ]]; then
   [[ -f "$output" ]] || exit 23

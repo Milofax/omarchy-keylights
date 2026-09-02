@@ -312,6 +312,7 @@ request_path() (
   local -a args=(
     --disable
     --fail --silent --show-error
+    --max-filesize 65536
     --noproxy '*'
   )
 
