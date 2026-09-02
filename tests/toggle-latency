@@ -64,6 +64,7 @@ first_argument="${1:-}"
 method=GET
 payload=''
 max_time=0
+max_filesize=unset
 retry_count=unset
 retry_max_time=unset
 output=''
@@ -75,6 +76,7 @@ while (( $# > 0 )); do
     --disable) shift ;;
     --request) method="$2"; shift 2 ;;
     --data) payload="$2"; shift 2 ;;
+    --max-filesize) max_filesize="$2"; shift 2 ;;
     --max-time) max_time="$2"; shift 2 ;;
     --noproxy) noproxy="$2"; shift 2 ;;
     --output) output="$2"; shift 2 ;;
@@ -99,9 +101,9 @@ if [[ -n "$output" ]]; then
   [[ -f "$output" ]] || exit 23
   output_mode=regular
 fi
-printf '%s attempt=%s retry=%s max-time=%s retry-max-time=%s output=%s disable=%s noproxy=%s\n' \
+printf '%s attempt=%s retry=%s max-time=%s retry-max-time=%s output=%s disable=%s noproxy=%s max-filesize=%s\n' \
   "$method" "$attempt" "$retry_count" "$max_time" "$retry_max_time" "$output_mode" \
-  "$([[ "$first_argument" == --disable ]] && printf first || printf no)" "$noproxy" \
+  "$([[ "$first_argument" == --disable ]] && printf first || printf no)" "$noproxy" "$max_filesize" \
   >>"$KEYLIGHTS_LATENCY_CALLS"
 
 write_response() {
@@ -176,6 +178,8 @@ awk '$6 != "output=regular" { exit 1 }' "$calls_file" || \
   fail "$action did not isolate every curl response in a regular output file"
 awk '$7 != "disable=first" || $8 != "noproxy=*" { exit 1 }' "$calls_file" || \
   fail "$action allowed curl configuration or proxies to alter local control requests"
+awk '$9 != "max-filesize=65536" { exit 1 }' "$calls_file" || \
+  fail "$action did not bound every curl response to 65536 bytes"
 
 latency_ms="$(<"$latency_file")"
 maximum_ms="${KEYLIGHTS_LATENCY_MAXIMUM_MS:-2000}"
